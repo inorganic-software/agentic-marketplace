@@ -1,0 +1,8 @@
+{
+  "name": "hello-world",
+  "description": "Sample plugin with a skill that writes Hola mundo to a text file",
+  "version": "0.1.0",
+  "author": {
+    "name": "Inorganic"
+  }
+}

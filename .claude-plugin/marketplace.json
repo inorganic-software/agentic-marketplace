@@ -1,0 +1,16 @@
+{
+  "name": "agentic-marketplace",
+  "owner": {
+    "name": "Inorganic"
+  },
+  "metadata": {
+    "description": "Plugins for Claude Code and GitHub Copilot"
+  },
+  "plugins": [
+    {
+      "name": "hello-world",
+      "description": "Sample plugin with a skill that writes Hola mundo to a text file",
+      "source": "./plugins/hello-world"
+    }
+  ]
+}
