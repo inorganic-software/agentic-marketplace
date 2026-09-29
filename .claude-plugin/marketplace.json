@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "hello-world",
-      "description": "Sample plugin with a skill that writes Hola mundo to a text file",
+      "description": "Sample plugin with skills that write Hola mundo and Bye world to text files",
       "source": "./plugins/hello-world"
     }
   ]

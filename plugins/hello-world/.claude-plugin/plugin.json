@@ -1,7 +1,7 @@
 {
   "name": "hello-world",
-  "description": "Sample plugin with a skill that writes Hola mundo to a text file",
-  "version": "0.1.0",
+  "description": "Sample plugin with skills that write Hola mundo and Bye world to text files",
+  "version": "0.2.0",
   "author": {
     "name": "Inorganic"
   }

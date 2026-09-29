@@ -6,7 +6,7 @@ Plugin marketplace for Claude Code and GitHub Copilot.
 
 | Plugin | What it does |
 | --- | --- |
-| `hello-world` | Sample plugin. Its `hello-world` skill writes `Hola mundo` to `hello-world.txt` in the current folder. |
+| `hello-world` | Sample plugin. Its `hello-world` skill writes `Hola mundo` to `hello-world.txt`, and its `bye-world` skill writes `Bye world` to `bye-world.txt`, both in the current folder. |
 
 ## Use it in a repo
 
@@ -51,5 +51,5 @@ copilot plugin install hello-world@agentic-marketplace
 
 ## Run the skill
 
-- Claude Code: `/hello-world:hello-world`
-- Copilot: ask it to use the `hello-world` skill.
+- Claude Code: `/hello-world:hello-world` or `/hello-world:bye-world`
+- Copilot: ask it to use the `hello-world` or `bye-world` skill.
