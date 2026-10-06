@@ -1,0 +1,52 @@
+[project]
+name = "marketplace-evals"
+version = "0.1.0"
+description = "Runtime-agnostic behavioral evals for the marketplace's plugins"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "pyyaml==6.0.3",
+]
+
+[project.scripts]
+evals-report = "marketplace_evals.reporting.markdown:main"
+evals-compare = "marketplace_evals.reporting.compare:main"
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+# All dependencies are pinned to the exact version (no ranges).
+add-bounds = "exact"
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.16.10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Evals launch the real agent (slow, use quota): only with `-m eval`.
+addopts = ["-m", "not eval"]
+markers = ["eval: runs the real agent against the goldens"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # pyflakes
+    "I",       # import order
+    "B",       # likely bugs
+    "UP",      # modern syntax for the pinned Python
+    "SIM",     # simpler forms
+    "C4",      # comprehensions
+    "RUF",     # ruff's own
+]
+ignore = [
+    "E501",    # line length: the formatter wraps what it can; long strings stay
+    "RUF001", "RUF002", "RUF003",  # "·", "—", "✅" are meant
+]

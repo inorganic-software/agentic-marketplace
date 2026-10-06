@@ -1,0 +1,21 @@
+# Pinned model IDs for the evals. Always exact IDs, never aliases ("sonnet", "opus"):
+# an alias silently moves to a new model and makes runs incomparable.
+#
+# Every run checks that the runtime really used these models and fails otherwise.
+# To try a new model, pass it on the command line (--model / --judge-model), compare
+# the results with the current ones, and only then update this file in its own commit.
+#
+# One section per provider (--provider), for the models of its own service, and one per
+# other backend (--backend), for the models it serves. Each names the same model differently.
+
+[claude]  # Claude Code runs the agent and the judge
+agent = "claude-sonnet-5-5"
+judge = "claude-opus-5-5"
+
+[copilot]  # Copilot CLI runs the agent and the judge
+agent = "claude-sonnet-5.5"
+judge = "claude-sonnet-5.5"
+
+[vertex]  # Vertex AI, through Copilot's BYOK provider (--backend vertex)
+agent = "google/gemini-3.8-flash"
+judge = "google/gemini-3.8-flash"

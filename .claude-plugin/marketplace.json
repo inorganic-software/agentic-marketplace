@@ -11,6 +11,11 @@
       "name": "hello-world",
       "description": "Sample plugin with skills that write Hola mundo and Bye world to text files",
       "source": "./plugins/hello-world"
+    },
+    {
+      "name": "commons",
+      "description": "Skills shared across repos and plugins, such as the git workflow",
+      "source": "./plugins/commons"
     }
   ]
 }

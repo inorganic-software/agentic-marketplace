@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eval comparison</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --surface: #fff; --text: #1d2330; --muted: #667085; --line: #e3e6eb;
+    --accent: #3b5bdb; --diff: #fff4d6; --diff-bar: #f0a020; --star: #c98a00;
+    --cell-s: 70%; --cell-l: 91%; --missing: #f0f1f4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --surface: #1a1e26; --text: #e6e9ef; --muted: #98a2b3; --line: #2b313c;
+      --accent: #7c95ff; --diff: #262318; --diff-bar: #e0a030; --star: #f2c14e;
+      --cell-s: 40%; --cell-l: 24%; --missing: #20242d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1280px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin-bottom: 12px; }
+  .toolbar input[type=search] { flex: 1 1 220px; min-width: 0; }
+  input, select, button { font: inherit; color: inherit; background: var(--surface);
+                          border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .35; cursor: default; }
+  label.toggle { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+
+  table { width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed;
+          background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
+  col.label { width: 34%; }
+  @media (max-width: 720px) {
+    col.label { width: 40%; } main { padding: 16px 8px; }
+    .card .controls button { padding: 0 5px; }
+  }
+  th, td { padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top;
+           text-align: left; overflow-wrap: anywhere; }
+  td.value { text-align: center; }
+
+  thead th { position: sticky; top: 0; z-index: 2; background: var(--surface);
+             border-bottom: 2px solid var(--line); padding: 10px; }
+  .card .name { font-weight: 600; }
+  .card .sub { color: var(--muted); font-size: 12px; }
+  .bar { height: 6px; border-radius: 3px; background: var(--missing); margin: 6px 0 2px; overflow: hidden; }
+  .bar > div { height: 100%; background: var(--accent); }
+  .card .controls { display: flex; gap: 4px; margin-top: 6px; }
+  .card .controls button { padding: 0 8px; }
+  .card .controls .remove { margin-left: auto; }
+  .add select { width: 100%; }
+
+  tr.section th { background: var(--bg); font-size: 15px; cursor: pointer; user-select: none; }
+  tr.section .plugin { color: var(--muted); font-weight: normal; font-size: 12px; margin-left: 8px; }
+  tr.metric th { cursor: pointer; user-select: none; padding-left: 22px; }
+  tr.check th { font-weight: normal; padding-left: 40px; font-size: 12.5px; color: var(--muted); }
+  tr.check td { font-size: 12.5px; }
+  tr.config th { font-weight: normal; padding-left: 22px; }
+  .caret { display: inline-block; width: 1em; color: var(--muted); }
+  tr.diff > th:first-child { background: var(--diff); box-shadow: inset 3px 0 var(--diff-bar); }
+  td.missing { background: var(--missing); color: var(--muted); }
+  .score, .errors { display: block; font-size: 12px; color: var(--muted); }
+  .errors { color: #c0392b; }
+  .star { color: var(--star); margin-left: 4px; }
+  .legend { color: var(--muted); font-size: 12px; font-weight: normal; }
+  .empty { color: var(--muted); padding: 24px; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Eval comparison</h1>
+  <div class="toolbar">
+    <input type="search" id="search" placeholder="Search goldens, metrics and checks (e.g. a skill name)">
+    <select id="plugin"><option value="">All plugins</option></select>
+    <select id="metric"><option value="">All metrics</option></select>
+    <label class="toggle"><input type="checkbox" id="diffs" checked> Highlight differences</label>
+    <button id="expand">Expand all</button>
+    <button id="collapse">Collapse all</button>
+    <span id="hidden" class="legend"></span>
+  </div>
+  <table id="table"></table>
+</main>
+<script id="data" type="application/json">/*__DATA__*/null</script>
+<script>
+"use strict";
+const DATA = JSON.parse(document.getElementById("data").textContent);
+const S = DATA.sessions;
+
+const state = {
+  order: [],                       // sessions on screen, left to right
+  closedSections: new Set(),       // "config" or a golden id; goldens start open
+  openMetrics: new Set(),          // "<golden>\n<metric>"; metrics start closed
+  search: "", plugin: "", metric: "", diffs: true,
+};
+const narrow = matchMedia("(max-width: 720px)");
+const maxVisible = () => (narrow.matches ? 2 : 4);
+// The picked sessions live in the URL (#s=<session>,<session>), so a reload or a
+// bookmark keeps them.
+const byName = new Map(S.map((s, i) => [s.name, i]));
+const fromHash = new URLSearchParams(location.hash.slice(1)).get("s");
+state.order = [...new Set((fromHash ?? "").split(",").filter(n => byName.has(n)).map(n => byName.get(n)))]
+  .slice(0, maxVisible());
+const saveHash = () => history.replaceState(null, "", state.order.length
+  ? `#s=${state.order.map(i => S[i].name).join(",")}` : location.pathname + location.search);
+
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") node.className = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else if (v !== undefined && v !== null) node.setAttribute(k, v);
+  }
+  for (const c of children.flat()) if (c !== null && c !== undefined) node.append(c);
+  return node;
+}
+
+// Comparable value of a cell, so that "differs" and "best" agree with what is shown.
+const cellKey = c => (c === null ? null : JSON.stringify([c.passed, c.total, c.score ?? null, c.verdict ?? null]));
+const cellRank = c => [c.rate ?? -1, c.score ?? -1];
+
+// A metric or check differs if the shown sessions that have it got different results;
+// a configuration field also differs if a session does not record it.
+function rowFlags(cells, missingCounts = false) {
+  const shown = state.order.map(i => cells[i]);
+  const compared = missingCounts ? shown : shown.filter(c => c !== null);
+  const keys = new Set(compared.map(c => (c === null ? "–" : typeof c === "object" ? cellKey(c) : String(c))));
+  return { differs: keys.size > 1, shown };
+}
+
+// Stars the highest rate (then mean score) among the shown sessions, ties included,
+// unless every session that has the row got the same.
+function bestOf(shown) {
+  const present = shown.filter(c => c !== null);
+  if (new Set(present.map(cellKey)).size < 2) return new Set();
+  const cmp = (a, b) => { const [x, y] = [cellRank(a), cellRank(b)]; return x[0] - y[0] || x[1] - y[1]; };
+  const top = present.reduce((a, b) => (cmp(a, b) >= 0 ? a : b));
+  return new Set(shown.map((c, j) => (c !== null && cmp(c, top) === 0 ? j : -1)).filter(j => j >= 0));
+}
+
+function colorOf(rate) {
+  return rate === null || rate === undefined ? "" : `hsl(${Math.round(rate * 120)} var(--cell-s) var(--cell-l))`;
+}
+
+function card(i, pos) {
+  const s = S[i];
+  const pct = s.metrics_total ? (100 * s.metrics_passed) / s.metrics_total : 0;
+  const move = d => () => {
+    [state.order[pos], state.order[pos + d]] = [state.order[pos + d], state.order[pos]];
+    render();
+  };
+  return el("th", { class: "card", title: s.label },
+    el("div", { class: "name" }, s.name),
+    el("div", { class: "sub" }, s.platform),
+    el("div", { class: "sub" }, s.model ?? "–"),
+    el("div", { class: "bar" }, el("div", { style: `width:${pct}%` })),
+    el("div", { class: "sub" }, `${s.metrics_passed}/${s.metrics_total} metrics passed`),
+    el("div", { class: "sub" }, `N=${s.runs ?? "–"} · min ${s.min_passes ?? "–"}`),
+    el("div", { class: "controls" },
+      el("button", { title: "Move left", onclick: move(-1), ...(pos === 0 && { disabled: "" }) }, "←"),
+      el("button", { title: "Move right", onclick: move(1),
+                     ...(pos === state.order.length - 1 && { disabled: "" }) }, "→"),
+      el("button", { class: "remove", title: "Remove from the comparison",
+                     onclick: () => { state.order.splice(pos, 1); render(); } }, "×")));
+}
+
+// An empty column: a dropdown with the sessions of the folder not shown yet, newest first.
+function addSlot() {
+  const hidden = S.map((_, i) => i).filter(i => !state.order.includes(i));
+  const select = el("select", { onchange: e => { state.order.push(+e.target.value); render(); } },
+    el("option", { value: "", selected: "" }, "+ pick a session"),
+    hidden.map(i => el("option", { value: i },
+      `${S[i].label} · ${S[i].metrics_passed}/${S[i].metrics_total} metrics`)));
+  return el("th", { class: "add" }, select);
+}
+
+function valueCell(c, star) {
+  if (c === null) return el("td", { class: "value missing" }, "–");
+  const td = el("td", { class: "value", style: `background:${colorOf(c.rate)}` });
+  td.append(c.verdict === undefined ? "" : c.verdict ? "✅ " : "❌ ", `${c.passed}/${c.total}`);
+  if (star) td.append(el("span", { class: "star", title: "Best of the shown sessions" }, "★"));
+  if (c.score !== undefined) td.append(el("span", { class: "score" }, c.score === null ? "no score" : `score ${c.score.toFixed(2)}`));
+  if (c.errors) td.append(el("span", { class: "errors" }, `${c.errors} run${c.errors > 1 ? "s" : ""} with errors`));
+  return td;
+}
+
+function dataRow(cls, labelNode, cells, onclick) {
+  const { differs, shown } = rowFlags(cells);
+  const best = bestOf(shown);
+  return el("tr", { class: `${cls}${state.diffs && differs ? " diff" : ""}` },
+    el("th", { ...(onclick && { onclick }) }, labelNode),
+    shown.map((c, j) => valueCell(c, best.has(j))),
+    padCells());
+}
+
+// Empty columns, each with a "+ pick a session" dropdown.
+let pad = 0;
+const padCells = () => Array.from({ length: pad }, () => el("td"));
+
+function sectionRow(id, ...title) {
+  const open = !state.closedSections.has(id) || state.search !== "";
+  const toggle = () => { state.closedSections.has(id) ? state.closedSections.delete(id) : state.closedSections.add(id); render(); };
+  return [el("tr", { class: "section" },
+    el("th", { colspan: 1 + state.order.length + pad, onclick: toggle },
+      el("span", { class: "caret" }, open ? "▾" : "▸"), ...title)), open];
+}
+
+function visibleGoldens() {
+  const q = state.search.toLowerCase();
+  const has = text => text.toLowerCase().includes(q);
+  // Only what at least one shown session has: the folder may hold sessions of other goldens.
+  const inShown = row => state.order.some(i => row.cells[i] !== null);
+  return DATA.goldens
+    .filter(g => !state.plugin || g.plugin === state.plugin)
+    .map(g => {
+      const metrics = g.metrics
+        .filter(m => (!state.metric || m.name === state.metric) && inShown(m))
+        .map(m => {
+          const own = m.checks.filter(inShown);
+          if (!q || has(g.id) || has(m.name)) return { ...m, checks: own, shownChecks: own, forced: false };
+          const checks = own.filter(c => has(c.id));
+          return checks.length ? { ...m, checks: own, shownChecks: checks, forced: true } : null;
+        })
+        .filter(Boolean);
+      return metrics.length ? { ...g, shownMetrics: metrics } : null;
+    })
+    .filter(Boolean);
+}
+
+function render() {
+  const table = document.getElementById("table");
+  const hidden = S.length - state.order.length;
+  pad = Math.min(maxVisible() - state.order.length, hidden);
+  saveHash();
+  table.replaceChildren();
+  document.getElementById("hidden").textContent = hidden && !pad
+    ? `${hidden} more session${hidden > 1 ? "s" : ""} in the folder: at most ${maxVisible()} at a time, remove one (×) to pick another`
+    : "";
+
+  table.append(el("colgroup", {}, el("col", { class: "label" }),
+    state.order.map(() => el("col")), Array.from({ length: pad }, () => el("col"))));
+  table.append(el("thead", {}, el("tr", {},
+    el("th", {}, el("div", { class: "legend" },
+      "Passed runs out of N per metric, passed out of scored per check. ★ best of the shown sessions.")),
+    state.order.map(card), Array.from({ length: pad }, addSlot))));
+
+  const body = el("tbody");
+  if (!state.order.length) {
+    body.append(el("tr", {}, el("td", { class: "empty", colspan: 1 + pad },
+      `Pick the sessions to compare from the dropdowns above (${S.length} in the folder).`)));
+    table.append(body);
+    return;
+  }
+  const [configHead, configOpen] = sectionRow("config", "Configuration");
+  body.append(configHead);
+  if (configOpen) {
+    for (const row of DATA.config) {
+      const { differs, shown } = rowFlags(row.values, true);
+      body.append(el("tr", { class: `config${state.diffs && differs ? " diff" : ""}` },
+        el("th", {}, row.label),
+        shown.map(v => (v === null ? el("td", { class: "value missing" }, "–") : el("td", { class: "value" }, String(v)))),
+        padCells()));
+    }
+  }
+
+  const goldens = visibleGoldens();
+  for (const g of goldens) {
+    const [head, open] = sectionRow(g.id, g.id, el("span", { class: "plugin" }, g.plugin ?? ""));
+    body.append(head);
+    if (!open) continue;
+    for (const m of g.shownMetrics) {
+      const key = `${g.id}\n${m.name}`;
+      const mOpen = m.forced || state.openMetrics.has(key);
+      const toggle = () => { state.openMetrics.has(key) ? state.openMetrics.delete(key) : state.openMetrics.add(key); render(); };
+      body.append(dataRow("metric", el("span", {}, el("span", { class: "caret" }, m.checks.length ? (mOpen ? "▾" : "▸") : ""), m.name),
+                          m.cells, toggle));
+      if (mOpen) for (const c of m.shownChecks) body.append(dataRow("check", c.id, c.cells));
+    }
+  }
+  if (!goldens.length) {
+    body.append(el("tr", {}, el("td", { class: "empty", colspan: 1 + state.order.length + pad }, "No golden matches the filters.")));
+  }
+  table.append(body);
+}
+
+function setup() {
+  const plugins = [...new Set(DATA.goldens.map(g => g.plugin).filter(Boolean))].sort();
+  const metrics = [...new Set(DATA.goldens.flatMap(g => g.metrics.map(m => m.name)))].sort();
+  document.getElementById("plugin").append(...plugins.map(a => el("option", { value: a }, a)));
+  document.getElementById("metric").append(...metrics.map(m => el("option", { value: m }, m)));
+
+  document.getElementById("search").addEventListener("input", e => { state.search = e.target.value.trim(); render(); });
+  document.getElementById("plugin").addEventListener("change", e => { state.plugin = e.target.value; render(); });
+  document.getElementById("metric").addEventListener("change", e => { state.metric = e.target.value; render(); });
+  document.getElementById("diffs").addEventListener("change", e => { state.diffs = e.target.checked; render(); });
+  document.getElementById("expand").addEventListener("click", () => {
+    state.closedSections.clear();
+    for (const g of DATA.goldens) for (const m of g.metrics) state.openMetrics.add(`${g.id}\n${m.name}`);
+    render();
+  });
+  document.getElementById("collapse").addEventListener("click", () => {
+    state.openMetrics.clear();
+    for (const g of DATA.goldens) state.closedSections.add(g.id);
+    render();
+  });
+  narrow.addEventListener("change", () => { state.order = state.order.slice(0, maxVisible()); render(); });
+  render();
+}
+setup();
+</script>
+</body>
+</html>

@@ -1,0 +1,129 @@
+name: Evals
+
+# Runs the behavioral evals (evals/README.md) on Copilot CLI with Vertex AI
+# models when a PR changes the plugins or the evals. Informative: a case below
+# --min-passes turns the job red, but it is not a required check. Results go to
+# the job summary, a PR comment updated on every push, and an artifact with the
+# logs, final files and state of every run.
+on:
+  pull_request:
+    paths:
+      - plugins/**
+      - evals/**
+      - .github/workflows/evals.yml
+
+permissions:
+  contents: read
+
+# A new push cancels the evals still running for the previous one, so they
+# stop spending.
+concurrency:
+  group: evals-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  evals:
+    name: evals
+    # PRs from forks get no OIDC token for this repo, so they could not sign in
+    # to Google Cloud.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write # Workload Identity Federation
+      pull-requests: write # the results comment
+    defaults:
+      run:
+        working-directory: evals
+    # This repo is public: everything about GCP comes from repo variables.
+    env:
+      EVALS_VERTEX_PROJECT: ${{ vars.EVALS_VERTEX_PROJECT }}
+      EVALS_VERTEX_LOCATION: ${{ vars.EVALS_VERTEX_LOCATION }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Signs in as the evals service account, which can only call Vertex AI
+      # (roles/aiplatform.user). It writes Application Default Credentials, from
+      # which Copilot gets a fresh token before every model request.
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_EVALS_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      # The version the evals were checked with (evals/README.md).
+      - name: Install Copilot CLI
+        run: npm install --global @github/copilot@1.0.91
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.19"
+          enable-cache: true
+          cache-dependency-glob: evals/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Run evals
+        run: uv run pytest -m eval -s --provider copilot --backend vertex --runs 3 --min-passes 2
+
+      - name: Build report
+        id: report
+        if: ${{ !cancelled() }}
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          results="$(ls .runs/*/results.json 2>/dev/null | head -n 1)"
+          if [[ -n "$results" ]]; then
+            uv run evals-report "$results" --run-url "$RUN_URL" >report.md
+          else
+            printf '%s\n## Evals: ❌ did not finish\n\nNo results were written. See the [workflow run](%s).\n' \
+              '<!-- marketplace-evals -->' "$RUN_URL" >report.md
+          fi
+          cat report.md >>"$GITHUB_STEP_SUMMARY"
+          if [[ -n "$results" ]]; then
+            summary="$(dirname "$results")/summary.txt"
+            {
+              echo
+              echo '<details><summary>summary.txt</summary>'
+              echo
+              echo '```text'
+              cat "$summary"
+              echo '```'
+              echo '</details>'
+            } >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Comment on the PR
+        if: ${{ !cancelled() && steps.report.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          # The comment from an earlier push, found by the marker at its start.
+          id="$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- marketplace-evals -->"))) | .id' \
+            | head -n 1)"
+          if [[ -n "$id" ]]; then
+            gh api --method PATCH "repos/$REPO/issues/comments/$id" -F body=@report.md >/dev/null
+          else
+            gh api --method POST "repos/$REPO/issues/$PR/comments" -F body=@report.md >/dev/null
+          fi
+
+      - name: Upload logs and results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: evals-runs
+          path: evals/.runs/
+          include-hidden-files: true
+          if-no-files-found: warn

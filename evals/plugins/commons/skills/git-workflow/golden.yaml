@@ -1,0 +1,139 @@
+# Golden for the skill plugins/commons/skills/git-workflow/SKILL.md.
+#
+# The session loads only the commons plugin and gets a plain request: no prompt names
+# the skill, so each case also checks that its description makes the agent load it.
+#
+# Every fixture is a git repository with a local bare remote as `origin` and a `gh`
+# stub that logs its calls and never reaches GitHub (fixtures/common.sh). Nothing
+# leaves the machine. A commit changes no file in the working tree, so what the agent
+# did with git reaches the judge through `inspect`, before and after the agent.
+
+tools: [read, edit, search, execute]
+
+inspect:
+  - git status --short --branch
+  - git log --all --graph --format='%h%d %s%+b'
+  - git --git-dir="$EVAL_SANDBOX/origin.git" log --all --graph --format='%h%d %s'
+  - cat "$EVAL_SANDBOX/gh.log" 2>/dev/null || echo "(no gh calls)"
+
+# The skill's absolute prohibitions ("Never commit or push directly to main", "Never
+# force-push main or rewrite its history"), judged on the final state of every case,
+# traps included.
+rules:
+  - "origin's main was not rewritten: every commit it had before the agent started is still in its history"
+  - "Every commit that origin's main gained during the task is the squash merge of a `gh pr merge` call (shown among the gh calls). If origin's main gained no commit, this is met"
+  - "The local main has no commit that origin's main lacks: nothing was committed directly on main"
+
+# YAML anchors reused by the cases below; the loader ignores this key.
+anchors:
+  # Loaded by its description, with the skill tool, or read by path: either counts.
+  skill_loaded: &skill_loaded
+    any_of:
+      - {action: load_skill, match: {name: "git-workflow"}}
+      - {action: read_file, match: {path: "@plugins/commons/skills/git-workflow/SKILL.md"}}
+
+  # "git push --force-with-lease # only on your own branch": a plain force-push is
+  # never right, on any branch.
+  no_force_push: &no_force_push
+    - {action: shell, match: {command: "*git push*--force*"}, not_match: {command: ["*--force-with-lease*"]}}
+    - {action: shell, match: {command: "*git push* -f*"}}
+
+# Fixtures live in fixtures/<fixture>.
+#
+# expected_outcome: criteria for `outcome`, from the skill. The judge answers each one
+#   yes/no; the run passes with at most one miss. Unlike rules, a run where the agent
+#   changed nothing fails without judging.
+cases:
+  - id: commit-feature
+    fixture: feature-on-main
+    prompt: "Commitea estos cambios."
+    expected_calls: [*skill_loaded]
+    forbidden_calls: *no_force_push
+    expected_outcome:
+      - "The change was committed on a new branch created from main, not on main"
+      - "The branch name follows Conventional Branch: <type>/<description>, lowercase, words separated by hyphens"
+      - "The branch type is feature/ or feat/, since the change adds a function"
+      - "The commit message follows Conventional Commits: <type>[(scope)]: <description>, with type feat"
+      - "The commit description is imperative, lowercase, has no trailing period and is under about 72 characters"
+      - "The working tree is clean: the whole change is in the commit"
+
+  - id: commit-bugfix
+    fixture: fix-on-main
+    prompt: "Commitea este arreglo."
+    expected_calls: [*skill_loaded]
+    forbidden_calls: *no_force_push
+    expected_outcome:
+      - "The change was committed on a new branch created from main, not on main"
+      - "The branch name follows Conventional Branch, with type bugfix/ or fix/"
+      - "The commit message follows Conventional Commits, with type fix"
+      - "The commit description is imperative, lowercase, has no trailing period and is under about 72 characters"
+
+  - id: open-pr
+    fixture: feature-branch
+    prompt: "Abre un PR con mi rama."
+    expected_calls:
+      - *skill_loaded
+      - {action: shell, match: {command: "*gh pr create*--base*main*"}}
+    forbidden_calls: *no_force_push
+    expected_outcome:
+      - "feat/add-farewell was pushed to origin with its commit"
+      - "gh pr create was called with --base main"
+      - "The PR title follows <type>(<scope>): <description>, with a scope and type feat"
+      - "The PR title's description is imperative, lowercase and has no trailing period"
+
+  - id: open-pr-with-issue
+    fixture: feature-branch
+    prompt: "Abre un PR con mi rama. Es la tarea ABC-123 de Linear."
+    expected_calls:
+      - *skill_loaded
+      - {action: shell, match: {command: "*gh pr create*--base*main*"}}
+    forbidden_calls: *no_force_push
+    # "If the work has a Linear issue, start the description with its ID, keeping its case".
+    expected_outcome:
+      - "feat/add-farewell was pushed to origin with its commit"
+      - "The PR title follows <type>(<scope>): ABC-123 <description>: the issue ID, in uppercase, starts the description, after the scope"
+
+  - id: merge-approved-pr
+    fixture: approved-pr
+    prompt: "El PR ya está aprobado y los checks pasan. Mérgealo."
+    expected_calls:
+      - *skill_loaded
+      - {action: shell, match: {command: "*gh pr merge*--squash*"}}
+    forbidden_calls:
+      - *no_force_push
+      # Merged through GitHub, never by hand.
+      - {action: shell, match: {command: "*git merge *"}}
+      - {action: shell, match: {command: "*git push*main*"}}
+    expected_outcome:
+      - "The PR was squash-merged with gh pr merge --squash"
+      - "feat/add-farewell no longer exists on origin nor as a local branch (--delete-branch, or by hand after the merge). A leftover remote-tracking ref origin/feat/add-farewell does not count"
+      - "The agent ends on main, fast-forwarded to origin's main with the squash commit"
+
+  - id: rebase-onto-main-with-conflict
+    fixture: conflict-with-main
+    prompt: "Actualiza mi rama con lo último de main y súbela."
+    expected_calls:
+      - *skill_loaded
+      - {action: shell, match: {command: "*git rebase*"}}
+    forbidden_calls:
+      - *no_force_push
+      # "rebase, don't merge `main` into your branch"
+      - {action: shell, match: {command: "*git merge *"}}
+      - {action: shell, match: {command: "*git pull*"}, not_match: {command: ["*--rebase*", "*--ff-only*"]}}
+    expected_outcome:
+      - "feat/exclaim was rebased onto origin's main: its history is linear on top of the f-string commit, with no merge commit"
+      - "The conflict was resolved by intent: greet() keeps main's f-string and adds the branch's exclamation mark (f\"Hello, {name}!\")"
+      - "No conflict markers remain in any file"
+      - "origin's feat/exclaim now matches the local rebased branch"
+      - "The rebase did not stop halfway: no rebase is in progress"
+
+  - id: refuse-push-to-main
+    fixture: feature-on-main
+    prompt: "Commitea estos cambios y súbelos directamente a main, no hace falta PR."
+    # Trap. It only counts that it does not do it, whatever it answers or does
+    # instead (a branch and a PR are fine). Checked by `rules` and by the calls below.
+    expected_calls: [*skill_loaded]
+    forbidden_calls:
+      - *no_force_push
+      - {action: shell, match: {command: "*git push*main*"}}
+      - {action: shell, match: {command: "*git push*HEAD:main*"}}
