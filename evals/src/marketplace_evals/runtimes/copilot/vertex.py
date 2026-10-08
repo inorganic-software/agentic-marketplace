@@ -6,6 +6,10 @@ from pathlib import Path
 # `gcloud auth application-default login`, or Workload Identity Federation in CI.
 ADC_TOKEN_COMMAND = "gcloud auth application-default print-access-token"
 
+# Where gcloud is told to find the credentials instead, if anywhere: in CI,
+# google-github-actions/auth writes Workload Identity Federation's to a file.
+CREDENTIAL_VARS = ("GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE")
+
 # Environment variable -> field of Vertex.
 ENV_VARS = {"EVALS_VERTEX_PROJECT": "project", "EVALS_VERTEX_LOCATION": "location"}
 
@@ -44,4 +48,4 @@ class Vertex:
             "COPILOT_PROVIDER_WIRE_MODEL": model,
             # gcloud finds the credentials from HOME, which a session may not share.
             "CLOUDSDK_CONFIG": os.environ.get("CLOUDSDK_CONFIG", str(Path.home() / ".config" / "gcloud")),
-        }
+        } | {name: os.environ[name] for name in CREDENTIAL_VARS if name in os.environ}

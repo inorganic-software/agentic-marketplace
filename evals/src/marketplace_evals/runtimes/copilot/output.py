@@ -55,7 +55,9 @@ def failure(events: list[dict], stderr: str) -> str | None:
     if result is None:
         return excerpt(stderr) or "no result event in the output"
     if result.get("exitCode"):
-        return f"exit code {result['exitCode']}: {excerpt(stderr)}"
+        # The CLI says why in a session.error event, not on stderr.
+        errors = [e["data"].get("message", "") for e in events if e.get("type") == "session.error"]
+        return f"exit code {result['exitCode']}: {excerpt('; '.join(filter(None, errors)) or stderr)}"
     return None
 
 

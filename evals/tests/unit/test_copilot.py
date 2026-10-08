@@ -282,3 +282,24 @@ def test_reasoning_tokens_are_counted_apart_from_output():
     usage = usage_from_session([RESULT], otel, duration_s=1.0)
     assert (usage.output_tokens, usage.reasoning_tokens, usage.total_tokens) == (10, 30, 140)
     assert usage.ai_credits == 0.0
+
+
+def test_a_failed_session_says_why_from_its_session_error():
+    events = [
+        {
+            "type": "session.error",
+            "data": {"errorType": "query", "message": "COPILOT_PROVIDER_API_KEY_COMMAND exited with status 1"},
+        },
+        {**RESULT, "exitCode": 1},
+    ]
+    assert failure(events, "") == "exit code 1: COPILOT_PROVIDER_API_KEY_COMMAND exited with status 1"
+
+
+def test_vertex_passes_on_where_gcloud_finds_the_credentials(monkeypatch):
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/ci/gha-creds.json")
+    monkeypatch.setenv("CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", "/ci/gha-creds.json")
+    env = Vertex("p", "global").env("google/m")
+    assert (
+        env["GOOGLE_APPLICATION_CREDENTIALS"] == env["CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"] == "/ci/gha-creds.json"
+    )
+    assert "CLOUDSDK_CONFIG" in env
