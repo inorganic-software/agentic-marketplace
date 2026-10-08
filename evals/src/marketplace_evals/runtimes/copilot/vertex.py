@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 # Prints a fresh access token of the Application Default Credentials: a developer's
 # `gcloud auth application-default login`, or Workload Identity Federation in CI.
@@ -41,4 +42,6 @@ class Vertex:
             "COPILOT_PROVIDER_BASE_URL": self.base_url,
             "COPILOT_PROVIDER_API_KEY_COMMAND": ADC_TOKEN_COMMAND,
             "COPILOT_PROVIDER_WIRE_MODEL": model,
+            # gcloud finds the credentials from HOME, which a session may not share.
+            "CLOUDSDK_CONFIG": os.environ.get("CLOUDSDK_CONFIG", str(Path.home() / ".config" / "gcloud")),
         }

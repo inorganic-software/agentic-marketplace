@@ -12,7 +12,8 @@ session's count of metrics passed. A case with several prompt variants shows, un
 metric, a row per variant with its runs that passed (and, with a baseline, without the
 skill and the difference); checks are not broken down by variant. Each golden also
 has a row per efficiency measure: the median per run and, with a baseline, without the
-skill and the difference.
+skill and the difference. A golden whose runs made calls the fixture's stubs do not
+imitate gets a ⚠ row with how many runs did, per session (from schema 9).
 
     uv run evals-compare [.runs | .runs/<date> | .runs/<date>/results.json ...] [-o out.html] [--open]
 
@@ -105,6 +106,7 @@ def build_matrix(sessions: list[dict]) -> dict:
                     "id": case_id,
                     "plugin": case.get("plugin"),
                     "baseline": [None] * len(sessions),
+                    "stub_gaps": [None] * len(sessions),
                     "metrics": {},
                     "efficiency": {},
                 },
@@ -114,6 +116,7 @@ def build_matrix(sessions: list[dict]) -> dict:
                     measure, {"name": MEASURE_LABELS[measure], "cells": [None] * len(sessions)}
                 )
                 eff_row["cells"][i] = cell
+            golden["stub_gaps"][i] = _stub_gaps_cell(case, results.get("config", {}).get("runs"))
             if "baseline" in case:
                 golden["baseline"][i] = {
                     "with": case["baseline"]["with_skill"],
@@ -195,6 +198,16 @@ def _metric_cell(metric: dict, min_passes: int | None) -> dict:
     if "baseline" in metric:  # a session with a baseline; None if only the skill can pass it
         cell["baseline"] = _baseline_cell(metric["baseline"])
     return cell
+
+
+def _stub_gaps_cell(case: dict, runs: int | None) -> dict | None:
+    """The runs that made a call the fixture's stubs do not imitate, out of all, and with
+    a baseline, those without the skill. None without any, or before schema 9."""
+    with_skill = case.get("runs_with_stub_gaps") or 0
+    without_skill = case.get("runs_with_stub_gaps_without_skill")
+    if not with_skill and not without_skill:
+        return None
+    return {"runs": with_skill, "total": runs, "without": without_skill}
 
 
 def _variant_cells(metric: dict) -> dict[str, dict | None]:

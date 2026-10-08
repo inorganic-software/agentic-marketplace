@@ -1,3 +1,7 @@
+import json
+import os
+from pathlib import Path
+
 from marketplace_evals.runtimes.claude_code.output import RUNTIME, parse_stream_json
 from marketplace_evals.runtimes.process import excerpt, run_cli
 from marketplace_evals.runtimes.runner import AgentTask, Runner
@@ -12,6 +16,14 @@ TOOLS: dict[str, list[str]] = {
     "search": ["Grep", "Glob"],
     "execute": ["Bash"],
 }
+
+
+# What Claude Code may need to log in, if this process has it: an API key or a token
+# (`claude setup-token`), or another provider. A login of `claude /login` lives in the
+# keychain instead, and LOGIN_KEYS of ~/.claude.json say which one to use.
+LOGIN_VARS = {"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLOUD_ML_REGION"}
+LOGIN_PREFIXES = ("ANTHROPIC_",)
+LOGIN_KEYS = ("oauthAccount", "userID", "hasCompletedOnboarding")
 
 
 class ClaudeCodeRunner(Runner):
@@ -36,7 +48,8 @@ class ClaudeCodeRunner(Runner):
             "--permission-mode", "dontAsk",
             "--allowedTools", " ".join(allowed_tools(task.tools)),
         ]  # fmt: skip
-        done = run_cli(command, timeout=self.timeout_s, cwd=sandbox.workspace, env=sandbox.env())
+        write_login(sandbox.home)
+        done = run_cli(command, timeout=self.timeout_s, cwd=sandbox.workspace, env=sandbox.agent_env(login_env()))
         raw_log = self._save_log(sandbox, done.proc.stdout)
         if done.proc.returncode != 0:
             raise RuntimeError(f"claude exited with code {done.proc.returncode}: {excerpt(done.proc.stderr)}")
@@ -51,3 +64,16 @@ def allowed_tools(tools: tuple[str, ...]) -> list[str]:
     for tool in tools:
         allowed += [t for t in TOOLS[tool] if t not in allowed]
     return [*allowed, "Skill"]
+
+
+def login_env() -> dict[str, str]:
+    """The variables of this process that log Claude Code in, if any."""
+    return {k: v for k, v in os.environ.items() if k in LOGIN_VARS or k.startswith(LOGIN_PREFIXES)}
+
+
+def write_login(home: Path) -> None:
+    """The agent's ~/.claude.json, with only what says which login to use: without it,
+    Claude Code in a new HOME is not logged in."""
+    user_config = Path.home() / ".claude.json"
+    config = json.loads(user_config.read_text()) if user_config.is_file() else {}
+    (home / ".claude.json").write_text(json.dumps({k: config[k] for k in LOGIN_KEYS if k in config}))

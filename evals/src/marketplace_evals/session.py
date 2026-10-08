@@ -13,6 +13,7 @@ from marketplace_evals.efficiency import CaseEfficiency, Efficiency
 from marketplace_evals.evaluation import (
     AgentRun,
     CaseResult,
+    CaseStubGaps,
     case_baselines,
     run_agent,
     score_baseline,
@@ -29,6 +30,7 @@ from marketplace_evals.reporting.terminal import (
     format_efficiency,
     format_skill_loading,
     format_status,
+    format_stub_gaps,
     format_usage,
 )
 from marketplace_evals.runtimes import Judge, Runner
@@ -43,6 +45,7 @@ class SessionSummary:
     usage: str
     baseline: str | None  # each case with and without its skill, with a baseline
     skill_loading: str | None  # per skill, its `skill_loading` prompts that passed, if any ran
+    stub_gaps: str | None  # per case, its runs with calls the fixture's stubs do not imitate, if any
     files: list[Path]
 
 
@@ -123,6 +126,15 @@ class EvalSession:
             if key in cases
         ]
 
+    def stub_gaps(self) -> list[CaseStubGaps]:
+        """Per case, in the order the cases ran, its runs with calls the stubs do not imitate."""
+        cases = {r.case.key: r.case for r in self.results}
+        return [
+            CaseStubGaps(cases[key], runs, self.baseline_runs_by_case.get(key))
+            for key, runs in self.runs_by_case.items()
+            if key in cases
+        ]
+
     def finish(self) -> SessionSummary:
         """Write `results.json` and `summary.txt` in the session's logs folder."""
         wall_clock_s = time.monotonic() - self._start
@@ -133,13 +145,15 @@ class EvalSession:
         baseline = format_baselines(case_baselines(self.results)) if self.config.baseline else None
         summaries = skill_loading_summaries(self.results)
         skill_loading = format_skill_loading(summaries) if summaries else None
+        stub_gaps = self.stub_gaps()
+        gaps = format_stub_gaps(stub_gaps) if any(c.any for c in stub_gaps) else None
         logs_dir = self.config.logs_dir
         logs_dir.mkdir(parents=True, exist_ok=True)
 
         document = results_document(
             self.results, self.config, self.runner.version(), REPO_DIR,
             self.started_at, self.agent_usage(), self.judge.usage, wall_clock_s,
-            efficiencies, agent_without_skill,
+            efficiencies, agent_without_skill, stub_gaps,
         )  # fmt: skip
         results_file = logs_dir / "results.json"
         results_file.write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n")
@@ -151,6 +165,8 @@ class EvalSession:
             tables += f"\n== eval baseline\n{baseline}\n"
         if skill_loading is not None:
             tables += f"\n== eval skill loading\n{skill_loading}\n"
+        if gaps is not None:
+            tables += f"\n== eval stub gaps\n{gaps}\n"
         summary_file = logs_dir / "summary.txt"
         summary_file.write_text(f"{reports}\n\n{tables}")
-        return SessionSummary(efficiency, usage, baseline, skill_loading, [results_file, summary_file])
+        return SessionSummary(efficiency, usage, baseline, skill_loading, gaps, [results_file, summary_file])

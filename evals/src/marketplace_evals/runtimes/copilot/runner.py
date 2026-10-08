@@ -1,7 +1,6 @@
-import tempfile
 from pathlib import Path
 
-from marketplace_evals.runtimes.copilot.environment import isolated_env
+from marketplace_evals.runtimes.copilot.environment import session_env
 from marketplace_evals.runtimes.copilot.output import RUNTIME, failure, parse_events, read_jsonl, usage_from_session
 from marketplace_evals.runtimes.copilot.vertex import Vertex
 from marketplace_evals.runtimes.process import run_cli
@@ -56,11 +55,13 @@ class CopilotRunner(Runner):
             "--disable-builtin-mcps",
             "--allow-tool", ", ".join(permissions(task.tools)),
         ]  # fmt: skip
-        with tempfile.TemporaryDirectory(prefix="copilot-home-") as home:
-            otel_file = Path(home) / "otel.jsonl"
-            env = sandbox.env(isolated_env(Path(home), otel_file, self.model, self.vertex))
-            done = run_cli(command, timeout=self.timeout_s, cwd=sandbox.workspace, env=env)
-            otel_rows = read_jsonl(otel_file.read_text()) if otel_file.exists() else []
+        # Copilot's config dir, inside the agent's own HOME.
+        home = sandbox.home / ".copilot"
+        home.mkdir()
+        otel_file = home / "otel.jsonl"
+        env = sandbox.agent_env(session_env(home, otel_file, self.model, self.vertex))
+        done = run_cli(command, timeout=self.timeout_s, cwd=sandbox.workspace, env=env)
+        otel_rows = read_jsonl(otel_file.read_text()) if otel_file.exists() else []
         raw_log = self._save_log(sandbox, done.proc.stdout)
         events = read_jsonl(done.proc.stdout)
         if error := failure(events, done.proc.stderr):

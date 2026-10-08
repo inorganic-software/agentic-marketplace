@@ -15,10 +15,11 @@ YAML format:
     inspect:                               # shell commands whose output the judge sees,
       - git log --all --oneline            #   run before and after the agent
     before:                                # shell commands run before the agent, after the
-      - git rev-parse main > "$EVAL_SANDBOX/main-before"  # fixture's setup: state for the checks
+      MAIN_BEFORE: git rev-parse main      #   fixture's setup: what each prints is a variable
+                                           #   of the checks only, which the agent never sees
     rules_always_met:                      # checked by `rules_always_met` after the agent, in
       - name: "main was not rewritten"     #   every case: each passes if it exits with 0,
-        run: git merge-base --is-ancestor "$(cat "$EVAL_SANDBOX/main-before")" main  # all must
+        run: git merge-base --is-ancestor "$MAIN_BEFORE" main  # all must
     rules_always_met_judged:               # judged by `rules_always_met_judged` on the final
       - "No secret was committed"          #   workspace, every case, all must be met
     cases:
@@ -167,7 +168,8 @@ class GoldenCase:
     forbidden_calls: list[CallMatcher]
     tools: tuple[str, ...] = TOOLS
     inspect: tuple[str, ...] = ()  # commands whose output the judge sees
-    before: tuple[str, ...] = ()  # commands run before the agent, to record state for the checks
+    # (name, command) run before the agent: what each prints is $name in the checks.
+    before: tuple[tuple[str, str], ...] = ()
     rules_always_met: tuple[GoldenCheck, ...] = ()  # the skill's prohibitions, checked in every case
     rules_always_met_judged: list[str] = field(default_factory=list)  # the same, judged in every case
     outcome_checks: tuple[GoldenCheck, ...] = ()
@@ -252,7 +254,7 @@ def load_goldens(path: Path) -> list[GoldenCase]:
             forbidden_calls=[_matcher(m, path) for m in _spliced(case.get("forbidden_calls", []))],
             tools=tools,
             inspect=tuple(data.get("inspect", [])),
-            before=tuple(data.get("before", [])),
+            before=_before(data.get("before", {}), path),
             rules_always_met=rules_always_met,
             rules_always_met_judged=rules_always_met_judged,
             outcome_checks=_checks(case.get("outcome_checks", []), path),
@@ -344,6 +346,18 @@ def _tools(raw: list[str], source: Path) -> tuple[str, ...]:
     if unknown := set(raw) - set(TOOLS):
         raise GoldenError(f"{source}: unknown tools {sorted(unknown)}; use {list(TOOLS)}")
     return tuple(raw)
+
+
+# A `before` name: a shell variable of the checks, in uppercase.
+BEFORE_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
+
+
+def _before(raw: dict, source: Path) -> tuple[tuple[str, str], ...]:
+    if not isinstance(raw, dict) or not all(isinstance(c, str) for c in raw.values()):
+        raise GoldenError(f"{source}: `before` maps each name to a shell command: {raw!r}")
+    if bad := sorted(name for name in raw if not BEFORE_NAME.fullmatch(str(name))):
+        raise GoldenError(f"{source}: `before` names are uppercase shell variables (MAIN_BEFORE): {bad}")
+    return tuple(raw.items())
 
 
 def _checks(raw: list, source: Path) -> tuple[GoldenCheck, ...]:

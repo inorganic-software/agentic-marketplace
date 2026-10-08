@@ -19,24 +19,28 @@ GITHUB_TOKEN_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 
 
 def isolated_env(home: Path, otel_file: Path, model: str, vertex: Vertex | None = None) -> dict[str, str]:
-    """Environment for one session: its own telemetry file and a config dir that only
-    carries what picks the models.
+    """Environment for one judge session: this process's, without Copilot's own
+    variables, plus `session_env`."""
+    env = {name: value for name, value in os.environ.items() if not name.startswith(("COPILOT_", "GITHUB_COPILOT_"))}
+    if vertex is not None:
+        for name in GITHUB_TOKEN_VARS:
+            env.pop(name, None)
+    return env | session_env(home, otel_file, model, vertex)
+
+
+def session_env(home: Path, otel_file: Path, model: str, vertex: Vertex | None = None) -> dict[str, str]:
+    """What one session needs on top of a clean environment: its own telemetry file and
+    a config dir that only carries what picks the models.
 
     On GitHub that is the user's Copilot login: without it, Copilot falls back to the
     `gh` CLI's account, which may be another one with other models enabled. On Vertex
     it is the BYOK provider, and no GitHub login or token reaches the session.
     """
-    env = {
-        name: value
-        for name, value in os.environ.items()
-        if not name.startswith(("COPILOT_", "GITHUB_COPILOT_")) or name in KEPT_VARS
-    }
     if vertex is None:
         _copy_login(home)
+        env = {name: os.environ[name] for name in KEPT_VARS if name in os.environ}
     else:
-        for name in GITHUB_TOKEN_VARS:
-            env.pop(name, None)
-        env |= vertex.env(model)
+        env = vertex.env(model)
     env["COPILOT_HOME"] = str(home)
     env["COPILOT_OTEL_EXPORTER_TYPE"] = "file"
     env["COPILOT_OTEL_FILE_EXPORTER_PATH"] = str(otel_file)

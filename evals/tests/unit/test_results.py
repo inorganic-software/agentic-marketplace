@@ -4,11 +4,11 @@ from datetime import datetime
 from pathlib import Path
 
 from marketplace_evals.config import EvalConfig
-from marketplace_evals.evaluation import AgentRun, Baseline, CaseResult, RunResult
+from marketplace_evals.evaluation import AgentRun, Baseline, CaseResult, CaseStubGaps, RunResult
 from marketplace_evals.goldens import GoldenCase, PromptVariant
 from marketplace_evals.metrics import Check, MetricResult
 from marketplace_evals.reporting.results import results_document
-from marketplace_evals.trace import Trace
+from marketplace_evals.trace import StubGap, Trace
 from marketplace_evals.usage import Usage
 
 CASE = GoldenCase("case-a", "commons", "git-workflow", Path("f"), (PromptVariant("v", "p"),), [], [])
@@ -62,6 +62,7 @@ def test_checks_are_aggregated_across_runs_under_their_stable_key():
         "score": None,
         "error": "model mismatch",
         "log": "/logs/x.jsonl",
+        "stub_gaps": [],
     }
 
 
@@ -89,7 +90,7 @@ def test_with_a_baseline_each_metric_and_case_records_how_it_did_without_the_ski
     calls = replace(metric("expected_calls", True, True, True), baseline=Baseline(None, None))
     doc = document(outcome, calls, config=replace(CONFIG, baseline=True))
 
-    assert doc["schema_version"] == 8 and doc["config"]["baseline"] is True
+    assert doc["schema_version"] == 9 and doc["config"]["baseline"] is True
     case = doc["cases"]["commons/git-workflow/case-a"]
     assert case["baseline"] == {"with_skill": True, "without_skill": False}
     b = case["metrics"]["outcome"]["baseline"]
@@ -162,7 +163,7 @@ def test_each_outcome_check_records_whether_it_is_required():
     }
     # Metrics that do not tell required from optional record nothing about it.
     assert metrics["outcome_checks"]["checks"] == {"c": {"passed": 1, "scored": 1}}
-    assert doc["schema_version"] == 8
+    assert doc["schema_version"] == 9
 
 
 VARIANTS = replace(CASE, prompts=(PromptVariant("a", "A"), PromptVariant("b", "B"), PromptVariant("c", "C")))
@@ -195,3 +196,21 @@ def test_a_case_with_one_variant_records_no_breakdown():
     doc = document(CaseResult(CASE, "outcome", [variant_run("v", True)], 1))
     m = doc["cases"]["commons/git-workflow/case-a"]["metrics"]["outcome"]
     assert "variants" not in m and m["per_run"][0]["variant"] == "v"
+
+
+def test_each_run_records_its_stub_gaps_and_each_case_how_many_runs_had_any():
+    gap = StubGap("gh", ("pr", "create", "--fill"), "unknown flag: --fill")
+    with_gap = RunResult(AgentRun(Trace(runtime="t", stub_gaps=[gap])), MetricResult("m", 1.0, 1.0, []))
+    runs = [with_gap, run(Check("c", True))]
+    result = CaseResult(CASE, "outcome_checks", runs, required=1)
+    doc = results_document(
+        [result], CONFIG, None, Path("."), datetime(2026, 10, 8), Usage(), Usage(), 1.0,
+        stub_gaps=[CaseStubGaps(CASE, [r.run for r in runs], [runs[1].run])],
+    )  # fmt: skip
+    case = doc["cases"]["commons/git-workflow/case-a"]
+    assert case["metrics"]["outcome_checks"]["per_run"][0]["stub_gaps"] == [
+        {"stub": "gh", "argv": ["pr", "create", "--fill"], "reason": "unknown flag: --fill"}
+    ]
+    assert case["metrics"]["outcome_checks"]["per_run"][1]["stub_gaps"] == []
+    assert (case["runs_with_stub_gaps"], case["runs_with_stub_gaps_without_skill"]) == (1, 0)
+    assert doc["schema_version"] == 9

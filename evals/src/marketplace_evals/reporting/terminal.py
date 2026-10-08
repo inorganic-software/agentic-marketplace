@@ -5,10 +5,12 @@ from marketplace_evals.evaluation import (
     Baseline,
     CaseBaseline,
     CaseResult,
+    CaseStubGaps,
     LoadingTally,
     SkillLoadingSummary,
     VariantTally,
 )
+from marketplace_evals.trace import StubGap
 from marketplace_evals.usage import Usage, total
 
 MIN_CASE_COLUMN = 32
@@ -101,10 +103,12 @@ def _format_runs(result: CaseResult) -> list[str]:
         run = f"#{i} [{r.run.variant}]" if result.case.has_variants else f"#{i}"
         if r.run.error:
             lines.append(f"  {run} AGENT ERROR: {r.run.error}")
+            lines += _format_stub_gaps(r.run.stub_gaps)
             continue
         metric, trace = r.metric, r.run.trace
         if metric.error:
             lines.append(f"  {run} {metric.error} log={trace.raw_log}")
+            lines += _format_stub_gaps(r.run.stub_gaps)
             continue
         models = {agent: sorted(ms) for agent, ms in trace.models.items()}
         lines.append(
@@ -115,7 +119,13 @@ def _format_runs(result: CaseResult) -> list[str]:
         lines += [f"     [{'x' if c.passed else ' '}] {c.description}" for c in metric.checks]
         if metric.reason:
             lines.append(f"     judge: {metric.reason}")
+        lines += _format_stub_gaps(r.run.stub_gaps)
     return lines
+
+
+def _format_stub_gaps(gaps: list[StubGap]) -> list[str]:
+    """`stub gaps: gh pr create --fill: unknown flag: --fill · ...`, if the run made any."""
+    return [f"     stub gaps: {' · '.join(str(g) for g in gaps)}"] if gaps else []
 
 
 def format_delta(delta: float) -> str:
@@ -146,6 +156,24 @@ def format_skill_loading(summaries: list[SkillLoadingSummary]) -> str:
     for s in summaries:
         lines.append(f"{s.key:<{skill_width}}{format_tally(s.should_load):>20}{format_tally(s.should_not_load):>20}")
     lines.append("prompts that passed (the same minimum of runs as any case), and runs that passed")
+    return "\n".join(lines)
+
+
+def format_stub_gaps(cases: list[CaseStubGaps]) -> str:
+    """Per case with any, its runs that made a call the fixture's stubs do not imitate
+    (with a baseline, also without the skill), and each distinct call."""
+    rows = [c for c in cases if c.any]
+    lines = []
+    for c in rows:
+        runs = f"{c.runs_with_gaps}/{len(c.with_skill)} runs"
+        if c.without_skill is not None:
+            runs += f" · without skill {c.runs_with_gaps_without_skill}/{len(c.without_skill)}"
+        lines.append(f"{c.case.key}: {runs}")
+        lines += [f"  {gap}" for gap in c.distinct()]
+    lines.append(
+        "calls the fixture's stubs answered with an error because they do not imitate them: "
+        "the run may say more about the stub than about the agent"
+    )
     return "\n".join(lines)
 
 

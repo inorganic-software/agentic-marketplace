@@ -5,8 +5,10 @@
 - rules_always_met_judged / outcome: an LLM judge, criterion by criterion (criteria.py).
 - skill_loading: deterministic, whether the agent loads the skill, on the golden's
   `skill_loading` prompts only (skill_loading.py).
+- integrity: deterministic, whether the agent tried to read the eval or leave its
+  sandbox, on every case (integrity.py).
 
-The prohibitions (forbidden_calls, rules_always_met and rules_always_met_judged) are
+The prohibitions (forbidden_calls, rules_always_met, rules_always_met_judged and integrity) are
 strict: every run must pass them (pass^k), since a user needs them kept every time.
 The rest pass a case with `min_passes` of the runs, and are informative in a case marked
 `informative`: scored and reported, but they never fail the session.
@@ -20,6 +22,7 @@ from marketplace_evals.metrics.base import Check, MetricResult
 from marketplace_evals.metrics.calls import expected_calls, forbidden_calls
 from marketplace_evals.metrics.checks import outcome_checks, rules_always_met
 from marketplace_evals.metrics.criteria import outcome, rules_always_met_judged
+from marketplace_evals.metrics.integrity import integrity
 from marketplace_evals.metrics.skill_loading import skill_loading
 from marketplace_evals.runtimes.judge import Judge
 from marketplace_evals.trace import Trace
@@ -66,6 +69,7 @@ METRICS: dict[str, MetricSpec] = {
     ),
     "outcome": MetricSpec(outcome, lambda case: bool(case.expected_outcome)),
     "skill_loading": MetricSpec(lambda case, trace, _: skill_loading(case, trace), lambda case: case.is_skill_loading),
+    "integrity": MetricSpec(lambda case, trace, _: integrity(case, trace), lambda case: True, strict=True),
 }
 
 __all__ = [
@@ -76,6 +80,7 @@ __all__ = [
     "MetricSpec",
     "expected_calls",
     "forbidden_calls",
+    "integrity",
     "outcome",
     "outcome_checks",
     "rules_always_met",

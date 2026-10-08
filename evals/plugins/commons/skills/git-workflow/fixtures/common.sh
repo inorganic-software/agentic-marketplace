@@ -44,58 +44,20 @@ push_to_main_from_elsewhere() {
   rm -rf "$clone"
 }
 
-# `gh` stub, first in the PATH. It logs every call to $EVAL_SANDBOX/gh.log (the judge
-# sees it) and never reaches GitHub:
-#   - auth token: fails and is not logged. Copilot CLI itself runs it at startup to
-#     look for a GitHub token (checked on 1.0.91); it is not the agent's work, and the
-#     session must keep the login the runner gives it.
-#   - pr create: prints the URL of PR #7 and writes its title (--title/-t) to
-#     $EVAL_SANDBOX/gh/created-title, for the golden's checks.
-#   - pr view / pr checks / pr list: print $EVAL_SANDBOX/gh/<command>.txt, or
-#     <command>.json with --json, if the fixture wrote one.
-#   - pr merge: squash-merges the current branch into origin's main, as GitHub would,
-#     deletes the remote branch, and with --delete-branch switches to main and deletes
-#     the local branch. It does not pull. It appends the squash commit to
-#     $EVAL_SANDBOX/gh/merged, so the checks can tell it from a commit pushed by hand.
+# The `gh` stub (fixtures/gh), first in the PATH: GitHub without leaving the machine, with
+# origin.git as github.com/example/greeting. Its docstring says what it imitates and
+# where it keeps what the agent did; anything else fails as the real gh would and is
+# reported as a gap of the stub.
 install_gh_stub() {
   mkdir -p "$EVAL_SANDBOX/gh"
-  cat > "$EVAL_SANDBOX/bin/gh" <<'STUB'
-#!/usr/bin/env bash
-set -euo pipefail
-command="${1:-} ${2:-}"
-[[ "$command" == "auth token" ]] && exit 1
-{ printf 'gh'; printf " '%s'" "$@"; printf '\n'; } >> "$EVAL_SANDBOX/gh.log"
-case "$command" in
-  "pr create")
-    args=("$@")
-    for ((i = 0; i < ${#args[@]}; i++)); do
-      case "${args[i]}" in
-        --title=*) printf '%s\n' "${args[i]#--title=}" > "$EVAL_SANDBOX/gh/created-title" ;;
-        --title|-t) printf '%s\n' "${args[i+1]:-}" > "$EVAL_SANDBOX/gh/created-title" ;;
-      esac
-    done
-    echo "https://github.com/example/greeting/pull/7" ;;
-  "pr view"|"pr checks"|"pr list")
-    name="${command#pr }"
-    ext=txt; [[ " $* " == *" --json"* ]] && ext=json
-    if [[ -f "$EVAL_SANDBOX/gh/$name.$ext" ]]; then cat "$EVAL_SANDBOX/gh/$name.$ext"; fi ;;
-  "pr merge")
-    branch="$(git rev-parse --abbrev-ref HEAD)"
-    title="$(cat "$EVAL_SANDBOX/gh/title.txt" 2>/dev/null || echo "$branch")"
-    clone="$(mktemp -d)"
-    git clone -q "$EVAL_SANDBOX/origin.git" "$clone"
-    (cd "$clone" && git merge -q --squash "origin/$branch" >/dev/null \
-      && git commit -qm "$title (#7)" && git push -q origin main && git push -q origin --delete "$branch" \
-      && git rev-parse HEAD >> "$EVAL_SANDBOX/gh/merged")
-    rm -rf "$clone"
-    echo "✓ Squashed and merged pull request #7 ($title)"
-    if [[ " $* " == *" --delete-branch "* || " $* " == *" -d "* ]]; then
-      git switch -q main && git branch -q -D "$branch"
-      echo "✓ Deleted local branch $branch and switched to branch main"
-    fi ;;
-  "auth status")
-    echo "✓ Logged in to github.com account eval-agent" ;;
-esac
-STUB
+  cp "$(dirname "${BASH_SOURCE[0]}")/gh" "$EVAL_SANDBOX/bin/gh"
   chmod +x "$EVAL_SANDBOX/bin/gh"
+}
+
+# A PR that already exists when the agent starts, as JSON on stdin: number, title, body,
+# state, isDraft, reviewDecision, headRefName, baseRefName, labels and checks (each
+# {"name", "conclusion"}, a null conclusion while it runs). gh pr merge only merges it
+# if it is approved and every check passed, as main's protection would.
+write_pr() {
+  cat > "$EVAL_SANDBOX/gh/pr.json"
 }

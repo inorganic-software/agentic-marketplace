@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -7,8 +8,9 @@ import pytest
 from marketplace_evals import sandbox as sandbox_module
 from marketplace_evals.goldens import GoldenCheck
 from marketplace_evals.runtimes import AgentTask, Runner
+from marketplace_evals.runtimes.claude_code.runner import write_login
 from marketplace_evals.sandbox import Sandbox, SetupError
-from marketplace_evals.trace import Trace
+from marketplace_evals.trace import StubGap, Trace
 
 
 def fixture(tmp_path: Path, setup: str | None = None) -> tuple[Path, Path]:
@@ -56,12 +58,15 @@ def test_a_failing_setup_is_an_error(tmp_path):
         sandbox(tmp_path, setup="exit 3\n")
 
 
-def test_before_records_state_in_the_sandbox_and_a_failing_one_is_an_error(tmp_path):
+def test_before_returns_what_each_command_printed_and_a_failing_one_is_an_error(tmp_path):
     box = sandbox(tmp_path)
-    box.prepare(('echo recorded > "$EVAL_SANDBOX/state"',))
-    assert (box.root / "state").read_text() == "recorded\n"
-    with pytest.raises(SetupError, match="'false; true' exited with code 1"):
-        box.prepare(("false; true",))  # it fails at the first command that fails
+    assert box.prepare((("STATE", "echo recorded"), ("TWO", "printf 'a\\nb\\n'"))) == {
+        "STATE": "recorded",
+        "TWO": "a\nb",
+    }
+    assert sorted(p.name for p in box.root.iterdir()) == [".gitconfig", "bin", "home", "plugins", "tmp", "workspace"]
+    with pytest.raises(SetupError, match="before command BROKEN exited with code 1"):
+        box.prepare((("BROKEN", "false; true"),))  # it fails at the first command that fails
 
 
 def checks(box: Sandbox, **runs: str) -> dict[str, tuple[int, str]]:
@@ -158,9 +163,9 @@ def test_run_records_state_before_the_agent_and_runs_the_checks_after_it(tmp_pat
         plugin_dir,
         fixture_dir,
         ("read",),
-        before=('git rev-parse HEAD > "$EVAL_SANDBOX/head-before"',),
+        before=(("HEAD_BEFORE", "git rev-parse HEAD"),),
         checks=(
-            GoldenCheck("HEAD moved", 'test "$(git rev-parse HEAD)" != "$(cat "$EVAL_SANDBOX/head-before")"'),
+            GoldenCheck("HEAD moved", 'test "$(git rev-parse HEAD)" != "$HEAD_BEFORE"'),
             GoldenCheck("tree is clean", 'git status --porcelain\ntest -z "$(git status --porcelain)"'),
         ),
     )
@@ -183,11 +188,44 @@ def test_run_keeps_the_final_files_and_the_state_next_to_the_log(tmp_path):
     assert "== after\n$ echo state\nstate" in (tmp_path / "logs" / "case-0-abc.state.txt").read_text()
 
 
-def test_the_users_git_configuration_does_not_reach_the_sandbox(tmp_path):
-    env = Sandbox(tmp_path, "p").env({"PATH": os.environ["PATH"], "GIT_CONFIG_GLOBAL": "/home/me/.gitconfig"})
-    assert env["GIT_CONFIG_GLOBAL"] == str(tmp_path / ".gitconfig")
-    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
-    assert env["PATH"].startswith(f"{tmp_path / 'bin'}{os.pathsep}")
+def test_the_users_git_configuration_does_not_reach_the_sandbox(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/home/me/.gitconfig")
+    for env in (Sandbox(tmp_path, "p").env(), Sandbox(tmp_path, "p").agent_env()):
+        assert env["GIT_CONFIG_GLOBAL"] == str(tmp_path / ".gitconfig")
+        assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert env["PATH"].startswith(f"{tmp_path / 'bin'}{os.pathsep}")
+
+
+def test_the_agent_gets_a_clean_environment(tmp_path, monkeypatch):
+    venv_bin = sandbox_module.REPO_DIR / "evals" / ".venv" / "bin"
+    monkeypatch.setenv("PATH", os.pathsep.join([str(venv_bin), "/usr/bin", "/bin"]))
+    for name in (
+        "CLAUDE_CODE_SESSION_ID",
+        "VIRTUAL_ENV",
+        "EVALS_VERTEX_PROJECT",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "PWD",
+    ):
+        monkeypatch.setenv(name, "leak")
+    monkeypatch.setenv("LANG", "es_ES.UTF-8")
+    monkeypatch.setenv("LC_ALL", "es_ES.UTF-8")
+    box = Sandbox(tmp_path, "p")
+
+    env = box.agent_env({"ANTHROPIC_API_KEY": "key"})
+
+    assert "leak" not in env.values()
+    assert "EVAL_SANDBOX" not in env
+    assert env["PATH"] == os.pathsep.join([str(box.bin), "/usr/bin", "/bin"])  # without the repo's virtualenv
+    assert (env["HOME"], env["TMPDIR"]) == (str(box.home), str(box.tmp))
+    assert (env["LANG"], env["LC_ALL"], env["ANTHROPIC_API_KEY"]) == ("es_ES.UTF-8", "es_ES.UTF-8", "key")
+    assert box.env()["EVAL_SANDBOX"] == str(tmp_path)  # the harness's own commands keep it
+
+
+def test_the_sandbox_root_is_named_apart_from_the_run(tmp_path):
+    fixture_dir, plugin_dir = fixture(tmp_path)
+    box = Sandbox.create(tmp_path / "tmpx1", fixture_dir, plugin_dir, name="case-v-0-x1")
+    assert (box.root.name, box.log_name) == ("tmpx1", "case-v-0-x1")
+    assert box.home.is_dir() and box.tmp.is_dir()
 
 
 def test_a_baseline_sandbox_leaves_out_only_the_skill_under_evaluation(tmp_path):
@@ -205,3 +243,52 @@ def test_a_baseline_sandbox_leaves_out_only_the_skill_under_evaluation(tmp_path)
 def test_a_baseline_of_a_skill_the_plugin_lacks_is_an_error(tmp_path):
     with pytest.raises(SetupError, match="no skill 'missing'"):
         Sandbox.create(tmp_path / "run", *fixture(tmp_path), without_skill="missing")
+
+
+def test_stub_gaps_are_read_from_the_sandbox_skipping_what_is_not_a_gap(tmp_path):
+    box = sandbox(tmp_path)
+    assert box.stub_gaps() == []
+    (box.root / sandbox_module.STUB_GAPS_FILE).write_text(
+        '{"stub": "gh", "argv": ["pr", "create", "--fill"], "reason": "unknown flag: --fill"}\n'
+        "not json\n"
+        '{"stub": "gh"}\n'
+        "[1, 2]\n"
+        '{"stub": "gh", "argv": ["foo"], "reason": "unknown command"}\n'
+    )
+    gaps = box.stub_gaps()
+    assert gaps == [
+        StubGap("gh", ("pr", "create", "--fill"), "unknown flag: --fill"),
+        StubGap("gh", ("foo",), "unknown command"),
+    ]
+    assert str(gaps[0]) == "gh pr create --fill: unknown flag: --fill"
+
+
+def test_run_records_the_stub_gaps_of_the_agent_only(tmp_path):
+    gap = '{"stub": "gh", "argv": ["x"], "reason": "r"}'
+    fixture_dir, plugin_dir = fixture(tmp_path)
+    t = AgentTask(
+        "p",
+        plugin_dir,
+        fixture_dir,
+        ("read",),
+        checks=(GoldenCheck("a check's own gap", f"echo '{gap}' >> \"$EVAL_SANDBOX/stub-gaps.jsonl\""),),
+    )
+    trace = FakeRunner(f"echo '{gap}' >> \"$EVAL_SANDBOX/stub-gaps.jsonl\"").run(t, tmp_path / "run")
+    assert trace.stub_gaps == [StubGap("gh", ("x",), "r")]
+
+
+def test_claude_code_gets_only_what_says_which_login_to_use(tmp_path, monkeypatch):
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    (user_home / ".claude.json").write_text(
+        json.dumps(
+            {"oauthAccount": {"emailAddress": "a@b.c"}, "userID": "u", "projects": {"/repo": {}}, "mcpServers": {}}
+        )
+    )
+    monkeypatch.setattr(Path, "home", lambda: user_home)
+    write_login(tmp_path)
+
+    assert json.loads((tmp_path / ".claude.json").read_text()) == {
+        "oauthAccount": {"emailAddress": "a@b.c"},
+        "userID": "u",
+    }

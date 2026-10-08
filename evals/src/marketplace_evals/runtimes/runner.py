@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from marketplace_evals.goldens import GoldenCheck
+from marketplace_evals.integrity import breaches
 from marketplace_evals.sandbox import Sandbox, changed_files
 from marketplace_evals.trace import Trace
 
@@ -21,7 +22,7 @@ class AgentTask:
     fixture_dir: Path  # what the agent will see as its repo, plus an optional setup.sh
     tools: tuple[str, ...]  # what the agent may use, in the goldens' vocabulary
     inspect: tuple[str, ...] = ()  # commands whose output the judge sees
-    before: tuple[str, ...] = ()  # commands that record state for the checks, before the agent
+    before: tuple[tuple[str, str], ...] = ()  # (name, command): state for the checks, before the agent
     checks: tuple[GoldenCheck, ...] = ()  # run after the agent, before the sandbox is deleted
     without_skill: str | None = None  # a baseline run: this skill is left out of the plugin
 
@@ -47,19 +48,22 @@ class Runner(ABC):
         out = subprocess.run([self.cli, "--version"], capture_output=True, text=True).stdout.strip()
         return out.splitlines()[0] if out else None
 
-    def run(self, task: AgentTask, root: Path) -> Trace:
-        """Run the task in `root` (empty and disposable) and return the trace."""
-        sandbox = Sandbox.create(root, task.fixture_dir, task.plugin_dir, task.without_skill)
-        sandbox.prepare(task.before)
+    def run(self, task: AgentTask, root: Path, name: str = "") -> Trace:
+        """Run the task in `root` (empty and disposable) and return the trace. `name`
+        (by default, the root's) names its logs."""
+        sandbox = Sandbox.create(root, task.fixture_dir, task.plugin_dir, task.without_skill, name)
+        before = sandbox.prepare(task.before)
         initial_files = sandbox.snapshot()
         initial_state = sandbox.inspect(task.inspect)
         trace = self._launch(task, sandbox)
+        trace.stub_gaps = sandbox.stub_gaps()  # before `inspect` and the checks, which are not the agent's
+        trace.integrity_breaches = breaches(trace.calls, sandbox)
         trace.prompt = task.prompt
         trace.final_files = sandbox.snapshot()
         trace.changed_files = changed_files(trace.final_files, initial_files)
         trace.initial_state = initial_state
         trace.final_state = sandbox.inspect(task.inspect)
-        trace.check_runs = sandbox.run_checks(task.checks)
+        trace.check_runs = sandbox.run_checks(task.checks, before)
         self._keep(trace, sandbox)
         return trace
 
@@ -72,7 +76,7 @@ class Runner(ABC):
         if self.logs_dir is None:
             return None
         self.logs_dir.mkdir(parents=True, exist_ok=True)
-        path = self.logs_dir / f"{sandbox.root.name}.jsonl"
+        path = self.logs_dir / f"{sandbox.log_name}.jsonl"
         path.write_text(output)
         return str(path)
 
@@ -80,14 +84,14 @@ class Runner(ABC):
         """Keep the final files and the state next to the log: the sandbox is deleted."""
         if self.logs_dir is None:
             return
-        kept = self.logs_dir / sandbox.root.name
+        kept = self.logs_dir / sandbox.log_name
         for rel, text in trace.final_files.items():
             path = kept / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
         if trace.final_state or trace.check_runs:
             self.logs_dir.mkdir(parents=True, exist_ok=True)
-            (self.logs_dir / f"{sandbox.root.name}.state.txt").write_text(
+            (self.logs_dir / f"{sandbox.log_name}.state.txt").write_text(
                 f"== before\n{trace.initial_state}\n\n== after\n{trace.final_state}\n" + _checks_text(trace)
             )
 

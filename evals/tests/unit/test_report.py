@@ -122,3 +122,16 @@ def test_informative_metrics_show_apart_and_do_not_count_in_the_title():
     assert "Informative: 0/1 metrics of informative cases reached the minimum" in report
     assert "ℹ️ 1/3 (2 req.)" in report
     assert "Informative:" not in render(RESULTS)
+
+
+def test_runs_with_stub_gaps_get_one_line_and_none_without_them():
+    assert "Stub gaps" not in render(RESULTS)
+    results = copy.deepcopy(RESULTS)
+    results["cases"]["commons/git-workflow/case-a"] |= {
+        "runs_with_stub_gaps": 1,
+        "runs_with_stub_gaps_without_skill": 2,
+    }
+    results["cases"]["commons/git-workflow/case-b"]["runs_with_stub_gaps"] = 0
+    report = render(results)
+    assert "⚠ Stub gaps: 3 runs made calls the fixture's stubs do not imitate" in report
+    assert "`commons/git-workflow/case-a` (3)" in report and "case-b`" not in report.split("Stub gaps")[1]

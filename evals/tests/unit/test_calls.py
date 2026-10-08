@@ -88,3 +88,29 @@ def test_forbidden_check_shows_the_offending_calls():
     result = forbidden_calls(CASE, trace(*[ToolCall("edit_file", {"path": f"f{i}"}, "Edit") for i in range(5)]))
     forbidden = result.checks[0].description
     assert "main: edit_file(path='f0')" in forbidden and "+2 more" in forbidden
+
+
+def shell(command: str) -> ToolCall:
+    return ToolCall("shell", {"command": command}, "Bash")
+
+
+def test_a_shell_pattern_matches_one_simple_command_not_the_whole_line():
+    push_to_main = CallMatcher("shell", {"command": "*git push*main*"})
+    # A branch pushed and its PR opened against main, in one line: no push to main.
+    pr = "git switch -c feat/x && git commit -m 'feat: x' && git push -u origin HEAD && gh pr create --base main"
+
+    assert not push_to_main.matches(shell(pr))
+    assert push_to_main.matches(shell("git add . && git commit -m x && git push origin main"))
+
+
+def test_match_and_not_match_look_at_the_same_simple_command():
+    plain_pull = CallMatcher("shell", {"command": "*git pull*"}, not_match={"command": ["*--rebase*", "*--ff-only*"]})
+
+    assert plain_pull.matches(shell("git pull origin main && git rebase --continue"))
+    assert not plain_pull.matches(shell("git fetch && git pull --rebase origin main"))
+
+
+def test_separators_inside_quotes_do_not_split():
+    push = CallMatcher("shell", {"command": "git push*"})
+    assert not push.matches(shell('git commit -m "fix: a && git push origin main"'))
+    assert push.matches(shell("git commit -m 'a; b' ; git push"))

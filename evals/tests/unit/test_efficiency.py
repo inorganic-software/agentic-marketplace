@@ -98,7 +98,7 @@ def test_results_record_each_case_efficiency_and_the_usage_without_the_skill():
     e = CaseEfficiency(CASE, Efficiency([run(9, 160, 0.25), run(1, 1, error="boom")]), Efficiency([run(6, 80, 0.2)]))
     doc = document(e, baseline=True)
 
-    assert doc["schema_version"] == 8
+    assert doc["schema_version"] == 9
     efficiency = doc["cases"]["commons/git-workflow/case-a"]["efficiency"]
     assert (efficiency["with_skill"]["runs"], efficiency["with_skill"]["total_runs"]) == (1, 2)
     assert efficiency["with_skill"]["median"]["turns"] == 9

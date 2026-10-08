@@ -229,3 +229,24 @@ def test_a_metric_with_variants_has_a_row_per_variant_with_and_without_the_skill
     assert variants["c"] == [None, None]  # no run got it; A has no such metric
     calls = next(m for m in matrix["goldens"][0]["metrics"] if m["name"] == "expected_calls")
     assert calls["variants"] == []  # a session before schema 7
+
+
+def test_a_golden_with_stub_gaps_has_a_cell_per_session_and_older_sessions_none():
+    with_gaps = session("20261008-1", {"case-a": {"plugin": "commons", "metrics": {}, "runs_with_stub_gaps": 1}})
+    with_baseline = session(
+        "20261008-2",
+        {
+            "case-a": {
+                "plugin": "commons",
+                "metrics": {},
+                "runs_with_stub_gaps": 0,
+                "runs_with_stub_gaps_without_skill": 2,
+            }
+        },
+    )
+    golden = build_matrix([with_gaps, with_baseline, A])["goldens"][0]
+    assert golden["stub_gaps"] == [
+        {"runs": 1, "total": 3, "without": None},
+        {"runs": 0, "total": 3, "without": 2},
+        None,
+    ]

@@ -82,7 +82,7 @@ def test_before_and_rules_always_met_are_shared_and_outcome_checks_belong_to_the
     path = golden(
         tmp_path,
         (
-            'before: [git rev-parse main > "$EVAL_SANDBOX/main"]\n'
+            "before: {MAIN_BEFORE: git rev-parse main}\n"
             "rules_always_met:\n  - {name: r, run: 'true'}\n"
             "cases:\n"
             "  - {id: a, fixture: f, prompts: [{id: v, text: p}], outcome_checks: [{name: clean, run: 'test -z x'}]}\n"
@@ -90,7 +90,7 @@ def test_before_and_rules_always_met_are_shared_and_outcome_checks_belong_to_the
         ),
     )
     a, b = load_goldens(path)
-    assert a.before == b.before == ('git rev-parse main > "$EVAL_SANDBOX/main"',)
+    assert a.before == b.before == (("MAIN_BEFORE", "git rev-parse main"),)
     assert a.rules_always_met == b.rules_always_met == (GoldenCheck("r", "true"),)
     assert a.outcome_checks == (GoldenCheck("clean", "test -z x"),)
     assert b.outcome_checks == ()
@@ -347,3 +347,10 @@ def test_a_single_variant_is_not_broken_down(tmp_path):
 def test_malformed_prompts_are_errors(tmp_path, prompts, error):
     with pytest.raises(GoldenError, match=error):
         load_goldens(golden(tmp_path, f"cases:\n  - {{id: c, fixture: f, {prompts}}}\n"))
+
+
+@pytest.mark.parametrize("before", ["[git rev-parse main]", "{main_before: git rev-parse main}", "{MAIN: [x]}"])
+def test_before_maps_uppercase_names_to_commands(tmp_path, before):
+    path = golden(tmp_path, f"before: {before}\ncases:\n  - {{id: a, fixture: f, prompts: [{{id: v, text: p}}]}}\n")
+    with pytest.raises(GoldenError, match="before"):
+        load_goldens(path)

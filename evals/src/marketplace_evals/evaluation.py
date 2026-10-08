@@ -20,16 +20,19 @@ also summed up per skill: how many of the prompts that should load it do, and ho
 of those that should not, do not.
 """
 
+import atexit
+import shutil
 import tempfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from functools import cache
 from pathlib import Path
 
 from marketplace_evals.goldens import GoldenCase
 from marketplace_evals.metrics import Metric, MetricResult
 from marketplace_evals.runtimes import AgentTask, Runner
-from marketplace_evals.trace import Trace
+from marketplace_evals.trace import StubGap, Trace
 from marketplace_evals.usage import model_mismatch
 
 
@@ -38,6 +41,10 @@ class AgentRun:
     trace: Trace | None  # kept even on error when there is one, for the usage summary
     error: str | None = None  # the run does not count: it is not scored
     variant: str | None = None  # id of the prompt variant it ran
+
+    @property
+    def stub_gaps(self) -> list[StubGap]:
+        return self.trace.stub_gaps if self.trace else []
 
 
 @dataclass(frozen=True)
@@ -231,6 +238,33 @@ def case_baselines(results: list[CaseResult]) -> list[CaseBaseline]:
 
 
 @dataclass(frozen=True)
+class CaseStubGaps:
+    """The runs of a case that made a call its fixture's stubs do not imitate, with the
+    skill and, with a baseline, without it. Only reported: it changes no score."""
+
+    case: GoldenCase
+    with_skill: list[AgentRun]
+    without_skill: list[AgentRun] | None = None  # with a baseline
+
+    @property
+    def runs_with_gaps(self) -> int:
+        return sum(bool(r.stub_gaps) for r in self.with_skill)
+
+    @property
+    def runs_with_gaps_without_skill(self) -> int | None:
+        return None if self.without_skill is None else sum(bool(r.stub_gaps) for r in self.without_skill)
+
+    @property
+    def any(self) -> bool:
+        return bool(self.runs_with_gaps or self.runs_with_gaps_without_skill)
+
+    def distinct(self) -> list[StubGap]:
+        """Every gap of every run, once, in the order they first appeared."""
+        runs = [*self.with_skill, *(self.without_skill or [])]
+        return list(dict.fromkeys(gap for r in runs for gap in r.stub_gaps))
+
+
+@dataclass(frozen=True)
 class LoadingTally:
     """`skill_loading` prompts of one kind (should load, or should not) and their runs."""
 
@@ -281,10 +315,20 @@ def skill_loading_summaries(results: list[CaseResult]) -> list[SkillLoadingSumma
     return list(summaries.values())
 
 
-def _run_once(runner: Runner, task: AgentTask, prefix: str) -> AgentRun:
-    with tempfile.TemporaryDirectory(prefix=prefix) as root:
+@cache
+def _sandboxes_dir() -> Path:
+    """The folder that holds this process's sandboxes, each named at random: what a
+    sandbox's path tells the agent says nothing of the eval, and anything else in this
+    folder is another run's (integrity.py)."""
+    folder = Path(tempfile.mkdtemp())
+    atexit.register(shutil.rmtree, folder, ignore_errors=True)
+    return folder
+
+
+def _run_once(runner: Runner, task: AgentTask, name: str) -> AgentRun:
+    with tempfile.TemporaryDirectory(dir=_sandboxes_dir()) as root:
         try:
-            trace = runner.run(task, Path(root))
+            trace = runner.run(task, Path(root), name + Path(root).name.removeprefix("tmp"))
         except Exception as e:  # a broken run counts as a failure, it does not abort the rest
             return AgentRun(None, f"{type(e).__name__}: {e}")
     # A run on a model other than the pinned one is not comparable: it does not count.

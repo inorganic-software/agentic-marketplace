@@ -216,6 +216,20 @@ function skillRow(cells) {
     padCells());
 }
 
+// Runs that made a call the fixture's stubs do not imitate: they answered with an error,
+// so the run may say more about the stub than about the agent. Only reported.
+function stubGapsRow(cells) {
+  const text = g => (g === null ? null
+    : `⚠ ${g.runs}/${g.total ?? "?"} runs` + (g.without == null ? "" : ` · w/o ${g.without}`));
+  const { differs, shown } = rowFlags(cells.map(text));
+  return el("tr", { class: `skill${state.diffs && differs ? " diff" : ""}` },
+    el("th", { title: "Runs with calls the fixture's stubs do not imitate (summary.txt lists them). They do not change any score." },
+      "stub gaps"),
+    shown.map(t => (t === null ? el("td", { class: "value missing" }, "–")
+      : el("td", { class: "value", title: "Runs with calls the stubs answered with an error because they do not imitate them" }, t))),
+    padCells());
+}
+
 // A measure of what the runs spent: the median per run, and with a baseline, without the
 // skill and the difference. No colour or star: spending less is not always better.
 function efficiencyRow(row) {
@@ -296,6 +310,7 @@ function render() {
       "ℹ️ a metric of an informative case: it never fails the session. " +
       "↳ prompt: the runs of one prompt variant of the case. " +
       "efficiency: the median per run of what the runs spent. " +
+      "⚠ stub gaps: runs with calls the fixture's stubs do not imitate. " +
     "With a baseline, w/o: passed without the skill, and Δ: the difference.")),
     state.order.map(card), Array.from({ length: pad }, addSlot))));
 
@@ -324,6 +339,7 @@ function render() {
     body.append(head);
     if (!open) continue;
     if (state.order.some(i => g.baseline[i] !== null)) body.append(skillRow(g.baseline));
+    if (state.order.some(i => (g.stub_gaps ?? [])[i])) body.append(stubGapsRow(g.stub_gaps));
     for (const m of g.shownMetrics) {
       const key = `${g.id}\n${m.name}`;
       const mOpen = m.forced || state.openMetrics.has(key);

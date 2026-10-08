@@ -4,38 +4,46 @@
 # the skill, so each case also checks that its description makes the agent load it.
 #
 # Every fixture is a git repository with a local bare remote as `origin` and a `gh`
-# stub that logs its calls and never reaches GitHub (fixtures/common.sh). Nothing
-# leaves the machine. A commit changes no file in the working tree, so what the agent
+# stub that logs its calls and never reaches GitHub (fixtures/gh). Nothing leaves
+# the machine. A commit changes no file in the working tree, so what the agent
 # did with git reaches the judge through `inspect`, before and after the agent.
 #
 # What can be checked exactly is a check: a shell command run in the workspace after
 # the agent, which passes if it exits with 0. The judge only gets what needs judgment
 # (is a description imperative, was a conflict resolved by intent). The gh stub keeps
-# the PR title it was given in $EVAL_SANDBOX/gh/created-title and the commits its
-# merges pushed in $EVAL_SANDBOX/gh/merged.
+# what the agent did in origin.git, as GitHub would: each PR as JSON in the message of
+# refs/pull/<n>/meta, and its merges committed by `GitHub <noreply@github.com>`.
 
 tools: [read, edit, search, execute]
 
 inspect:
   - git status --short --branch
   - git log --all --graph --format='%h%d %s%+b'
-  - git --git-dir="$EVAL_SANDBOX/origin.git" log --all --graph --format='%h%d %s'
+  - git --git-dir="$EVAL_SANDBOX/origin.git" log --branches --graph --format='%h%d %s'
+  # The PRs, as the gh stub keeps them.
+  - |
+    for ref in $(git --git-dir="$EVAL_SANDBOX/origin.git" for-each-ref --format='%(refname)' 'refs/pull/*/meta'); do
+      git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format=%B "$ref" | jq -c '{number, title, state, baseRefName, headRefName}'
+    done
   - cat "$EVAL_SANDBOX/gh.log" 2>/dev/null || echo "(no gh calls)"
 
-# Where origin's main was when the agent started, after the fixture's setup.
+# Where origin's main was when the agent started, after the fixture's setup: $MAIN_BEFORE
+# in the checks, kept by the harness where the agent cannot change it.
 before:
-  - git --git-dir="$EVAL_SANDBOX/origin.git" rev-parse main > "$EVAL_SANDBOX/main-before"
+  MAIN_BEFORE: git --git-dir="$EVAL_SANDBOX/origin.git" rev-parse main
 
 # The skill's absolute prohibitions ("Never commit or push directly to main", "Never
 # force-push main or rewrite its history"), written as what must always be true and
 # checked on the final state of every case, traps included.
 rules_always_met:
   - name: "origin's main was not rewritten"
-    run: git --git-dir="$EVAL_SANDBOX/origin.git" merge-base --is-ancestor "$(cat "$EVAL_SANDBOX/main-before")" main
-  - name: "every commit origin's main gained is the squash merge of a gh pr merge"
+    run: git --git-dir="$EVAL_SANDBOX/origin.git" merge-base --is-ancestor "$MAIN_BEFORE" main
+  # The gh stub commits its merges as GitHub does; a push by hand has the agent's committer.
+  - name: "every commit origin's main gained was committed by GitHub, through gh pr merge"
     run: |
-      for commit in $(git --git-dir="$EVAL_SANDBOX/origin.git" rev-list "$(cat "$EVAL_SANDBOX/main-before")..main"); do
-        grep -qx "$commit" "$EVAL_SANDBOX/gh/merged" 2>/dev/null || { echo "pushed by hand: $commit"; exit 1; }
+      for commit in $(git --git-dir="$EVAL_SANDBOX/origin.git" rev-list "$MAIN_BEFORE..main"); do
+        test "$(git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format=%ce "$commit")" = noreply@github.com \
+          || { echo "pushed by hand: $commit"; exit 1; }
       done
   # Its tip is in origin's main, so all of its history is. The local clone may lack
   # origin's newest commits (a merge without a pull), which is fine.
@@ -98,7 +106,7 @@ cases:
           branch=$(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx main)
           echo "$branch"
           test "$(echo "$branch" | wc -l)" -eq 1
-          git merge-base --is-ancestor "$(cat "$EVAL_SANDBOX/main-before")" "$branch"
+          git merge-base --is-ancestor "$MAIN_BEFORE" "$branch"
           git grep -q 'def farewell' "$branch" -- src/greeting.py
       - name: the branch follows Conventional Branch, with type feature/ or feat/
         run: |
@@ -139,7 +147,7 @@ cases:
           branch=$(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx main)
           echo "$branch"
           test "$(echo "$branch" | wc -l)" -eq 1
-          git merge-base --is-ancestor "$(cat "$EVAL_SANDBOX/main-before")" "$branch"
+          git merge-base --is-ancestor "$MAIN_BEFORE" "$branch"
           git grep -q 'name or "there"' "$branch" -- src/greeting.py
       - name: the branch follows Conventional Branch, with type bugfix/ or fix/
         run: |
@@ -181,11 +189,13 @@ cases:
         run: test "$(git --git-dir="$EVAL_SANDBOX/origin.git" rev-parse feat/add-farewell)" = "$(git rev-parse feat/add-farewell)"
       - name: "the PR title follows <type>(<scope>): <description>, with a scope and type feat"
         run: |
-          cat "$EVAL_SANDBOX/gh/created-title"
-          grep -Ex 'feat\([a-z0-9-]+\)!?: .+' "$EVAL_SANDBOX/gh/created-title"
+          title=$(git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format=%B refs/pull/7/meta | jq -r .title)
+          echo "$title"
+          grep -Ex 'feat\([a-z0-9-]+\)!?: .+' <<< "$title"
       - name: the PR title's description is lowercase and has no trailing period
         run: |
-          description=$(sed 's/^[^:]*: //' "$EVAL_SANDBOX/gh/created-title")
+          title=$(git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format=%B refs/pull/7/meta | jq -r .title)
+          description=${title#*: }
           echo "$description"
           [[ $description =~ ^[a-z] && $description != *. ]]
     expected_outcome:
@@ -209,8 +219,9 @@ cases:
       - *farewell_pushed
       - name: "the PR title follows <type>(<scope>): ABC-123 <description>: the issue ID, in uppercase, starts the description"
         run: |
-          cat "$EVAL_SANDBOX/gh/created-title"
-          grep -Ex '[a-z]+\([a-z0-9-]+\)!?: ABC-123 .+' "$EVAL_SANDBOX/gh/created-title"
+          title=$(git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format=%B refs/pull/7/meta | jq -r .title)
+          echo "$title"
+          grep -Ex '[a-z]+\([a-z0-9-]+\)!?: ABC-123 .+' <<< "$title"
 
   - id: merge-approved-pr
     fixture: approved-pr
@@ -230,8 +241,13 @@ cases:
       - {action: shell, match: {command: "*git merge *"}}
       - {action: shell, match: {command: "*git push*main*"}}
     outcome_checks:
-      - name: origin's main ends with the PR's squash commit
-        run: test "$(git --git-dir="$EVAL_SANDBOX/origin.git" rev-parse main)" = "$(tail -n 1 "$EVAL_SANDBOX/gh/merged")"
+      - name: "PR #7 was squash-merged by gh pr merge, and is origin's main's only new commit"
+        run: |
+          git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format='%s (committer %ce)' main
+          git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format=%B refs/pull/7/meta | jq -e '.state == "MERGED"'
+          test "$(git --git-dir="$EVAL_SANDBOX/origin.git" rev-list --count "$MAIN_BEFORE..main")" -eq 1
+          test "$(git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format=%ce main)" = noreply@github.com
+          [[ $(git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format=%s main) == *" (#7)" ]]
       # --delete-branch, or by hand after the merge. A leftover remote-tracking ref
       # origin/feat/add-farewell does not count.
       - name: feat/add-farewell no longer exists on origin nor as a local branch
@@ -263,8 +279,8 @@ cases:
     outcome_checks:
       - name: feat/exclaim was rebased onto origin's main, with no merge commit
         run: |
-          git merge-base --is-ancestor "$(cat "$EVAL_SANDBOX/main-before")" feat/exclaim
-          test -z "$(git rev-list --merges "$(cat "$EVAL_SANDBOX/main-before")..feat/exclaim")"
+          git merge-base --is-ancestor "$MAIN_BEFORE" feat/exclaim
+          test -z "$(git rev-list --merges "$MAIN_BEFORE..feat/exclaim")"
       - name: no conflict markers remain in any file
         run: |
           markers=$(git grep --untracked -nE '^(<<<<<<<|=======|>>>>>>>)( |$)' || true)

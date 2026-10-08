@@ -6,7 +6,8 @@ reasons and the offending calls are in `summary.txt`, uploaded with the logs. A 
 with a baseline also shows how each case and metric did without the skill, and one with
 `skill_loading` prompts, how many of each kind passed per skill. The metrics of an
 informative case that are not strict show with ℹ️ and are left out of the count in the
-title: they never fail the session.
+title: they never fail the session. Runs with calls the fixture's stubs do not imitate
+get one line, listed in `summary.txt`.
 
     uv run evals-report .runs/<date>/results.json [--run-url URL]
 """
@@ -82,6 +83,8 @@ def render(results: dict, run_url: str | None = None) -> str:
                 for skill, t in loading.items()
             ),
         ]
+    if gaps := _stub_gaps(cases):
+        lines += ["", gaps]
     lines += ["", _usage(results["usage"])]
     if run_url:
         lines += [
@@ -121,6 +124,22 @@ def _case_baseline(baseline: dict | None) -> str:
     if baseline is None:
         return "–"
     return "✅ ⚠ does not measure the skill" if baseline["without_skill"] else "❌"
+
+
+def _stub_gaps(cases: dict) -> str | None:
+    """One line with the runs that made calls the fixture's stubs do not imitate, if any."""
+    with_gaps = {
+        case_id: case.get("runs_with_stub_gaps", 0) + (case.get("runs_with_stub_gaps_without_skill") or 0)
+        for case_id, case in cases.items()
+    }
+    with_gaps = {case_id: runs for case_id, runs in with_gaps.items() if runs}
+    if not with_gaps:
+        return None
+    listed = ", ".join(f"`{case_id}` ({runs})" for case_id, runs in with_gaps.items())
+    return (
+        f"⚠ Stub gaps: {sum(with_gaps.values())} runs made calls the fixture's stubs do not imitate "
+        f"(they answered with an error): {listed}. The calls are in `summary.txt`."
+    )
 
 
 def _usage(usage: dict) -> str:

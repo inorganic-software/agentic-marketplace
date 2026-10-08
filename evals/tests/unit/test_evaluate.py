@@ -6,6 +6,7 @@ from marketplace_evals.evaluation import (
     AgentRun,
     Baseline,
     CaseResult,
+    CaseStubGaps,
     LoadingTally,
     case_baselines,
     run_agent,
@@ -22,11 +23,12 @@ from marketplace_evals.reporting.terminal import (
     format_delta,
     format_skill_loading,
     format_status,
+    format_stub_gaps,
 )
 from marketplace_evals.runtimes import AgentTask, Runner
 from marketplace_evals.sandbox import Sandbox
 from marketplace_evals.session import EvalSession
-from marketplace_evals.trace import Trace
+from marketplace_evals.trace import StubGap, Trace
 from marketplace_evals.usage import Usage
 
 CASE = GoldenCase("c", "plugin", "skill", Path("f"), (PromptVariant("v", "p"),), [], [])
@@ -41,12 +43,12 @@ class FakeRunner(Runner):
     def _launch(self, task: AgentTask, sandbox: Sandbox) -> Trace:
         raise NotImplementedError
 
-    def run(self, task: AgentTask, root: Path) -> Trace:
+    def run(self, task: AgentTask, root: Path, name: str = "") -> Trace:
         return Trace(
             runtime="fake",
             models={"main": {self.used}},
             usage=Usage(calls=1),
-            raw_log=f"{root.name}|{task.without_skill}",
+            raw_log=f"{name}|{task.without_skill}",
         )
 
 
@@ -300,10 +302,8 @@ VARIANTS = replace(
 class PromptRunner(FakeRunner):
     """Leaves in raw_log the run's folder and the prompt it was given."""
 
-    def run(self, task: AgentTask, root: Path) -> Trace:
-        return Trace(
-            runtime="fake", prompt=task.prompt, models={"main": {self.used}}, raw_log=f"{root.name}|{task.prompt}"
-        )
+    def run(self, task: AgentTask, root: Path, name: str = "") -> Trace:
+        return Trace(runtime="fake", prompt=task.prompt, models={"main": {self.used}}, raw_log=f"{name}|{task.prompt}")
 
 
 def test_run_i_gets_variant_i_mod_n_with_and_without_the_skill():
@@ -349,3 +349,19 @@ def test_with_a_baseline_each_variant_has_its_delta():
     assert "  baseline by variant: a 1/1 vs 1/1 (0 pp) · b 1/1 vs 0/1 (+100 pp) · c 1/1 vs 0/1 (+100 pp)" in report
     short = score_baseline(result, metric, with_skill, variant_runs("pass"), 2)
     assert short.variant_deltas() == {"a": 0, "b": None, "c": None}
+
+
+def test_stub_gaps_show_under_their_run_and_once_per_case_in_the_section():
+    gap = StubGap("gh", ("pr", "create", "--fill"), "unknown flag: --fill")
+    with_gap = AgentRun(Trace(runtime="t", stub_gaps=[gap, gap]))
+    runs = [with_gap, AgentRun(Trace(runtime="t"))]
+    report = format_case_result(score_runs(CASE, "expected_calls", expected_calls, runs, 1))
+    assert report.count("stub gaps: gh pr create --fill: unknown flag: --fill") == 1
+
+    other = replace(CASE, id="d")
+    section = format_stub_gaps([CaseStubGaps(CASE, runs, [with_gap]), CaseStubGaps(other, runs[1:])])
+    assert section.splitlines()[:2] == [
+        "plugin/skill/c: 1/2 runs · without skill 1/1",
+        "  gh pr create --fill: unknown flag: --fill",
+    ]
+    assert "plugin/skill/d" not in section

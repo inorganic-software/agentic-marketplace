@@ -14,7 +14,7 @@ from pathlib import Path
 
 from marketplace_evals.config import EvalConfig
 from marketplace_evals.efficiency import CaseEfficiency, Efficiency, run_measures
-from marketplace_evals.evaluation import Baseline, CaseResult, case_baselines, skill_loading_summaries
+from marketplace_evals.evaluation import Baseline, CaseResult, CaseStubGaps, case_baselines, skill_loading_summaries
 from marketplace_evals.usage import Usage
 
 # 2: each metric records the runs it required (`required`, `strict`) instead of `min_passes`.
@@ -27,7 +27,10 @@ from marketplace_evals.usage import Usage
 # 8: each case records its `efficiency` (median turns, tool calls, tokens, cost and time,
 #    with and without the skill), and `usage.agent` leaves out the runs without the skill,
 #    which go to `usage.agent_without_skill`.
-SCHEMA_VERSION = 8
+# 9: each run records its `stub_gaps` (calls the fixture's stubs do not imitate), and each
+#    case how many of its runs had any (`runs_with_stub_gaps`, and with a baseline
+#    `runs_with_stub_gaps_without_skill`).
+SCHEMA_VERSION = 9
 
 
 def results_document(
@@ -41,11 +44,17 @@ def results_document(
     wall_clock_s: float,
     efficiencies: Sequence[CaseEfficiency] = (),
     agent_without_skill: Usage | None = None,
+    stub_gaps: Sequence[CaseStubGaps] = (),
 ) -> dict:
     cases = _cases(case_results)
     for e in efficiencies:
         if e.case.key in cases:
             cases[e.case.key]["efficiency"] = _efficiency(e)
+    for g in stub_gaps:
+        if g.case.key in cases:
+            cases[g.case.key]["runs_with_stub_gaps"] = g.runs_with_gaps
+            if g.without_skill is not None:
+                cases[g.case.key]["runs_with_stub_gaps_without_skill"] = g.runs_with_gaps_without_skill
     usage = {"agent": _usage(agent_usage)}
     if agent_without_skill is not None:
         usage["agent_without_skill"] = _usage(agent_without_skill)
@@ -138,6 +147,7 @@ def _metric(result: CaseResult) -> dict:
             "score": None if metric is None or metric.error else round(metric.score, 4),
             "error": r.run.error or (metric.error if metric else None),
             "log": trace.raw_log if trace else None,
+            "stub_gaps": [{"stub": g.stub, "argv": list(g.argv), "reason": g.reason} for g in r.run.stub_gaps],
         })  # fmt: skip
         if metric is None or metric.error:  # not scored: its checks do not count
             continue

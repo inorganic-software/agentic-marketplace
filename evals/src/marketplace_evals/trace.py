@@ -60,6 +60,19 @@ class CheckRun:
         return self.exit_code == 0
 
 
+@dataclass(frozen=True)
+class StubGap:
+    """A call a fixture's stub (`gh`...) does not imitate: it answered with an error, as
+    the real tool would, and the run may say more about the stub than about the agent."""
+
+    stub: str  # the stub's command, `gh`
+    argv: tuple[str, ...]  # its arguments, without the command
+    reason: str  # the error it answered, `unknown flag: --fill`
+
+    def __str__(self) -> str:
+        return f"{' '.join((self.stub, *self.argv))}: {self.reason}"
+
+
 @dataclass
 class Trace:
     runtime: str
@@ -76,6 +89,9 @@ class Trace:
     initial_state: str = ""
     final_state: str = ""
     check_runs: dict[str, CheckRun] = field(default_factory=dict)  # the golden's checks, by name
+    stub_gaps: list[StubGap] = field(default_factory=list)  # calls the fixture's stubs do not imitate
+    # Calls that reached outside the sandbox or into the eval, with why (integrity.py).
+    integrity_breaches: list[str] = field(default_factory=list)
     raw_log: str | None = None  # path to the runtime's raw log, for debugging
     usage: Usage = field(default_factory=Usage)  # tokens, cost and time of the whole run
 

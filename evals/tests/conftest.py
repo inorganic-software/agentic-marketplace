@@ -78,6 +78,9 @@ def pytest_terminal_summary(terminalreporter, config: pytest.Config) -> None:
     if summary.skill_loading is not None:
         terminalreporter.section("eval skill loading")
         terminalreporter.write_line(summary.skill_loading)
+    if summary.stub_gaps is not None:
+        terminalreporter.section("eval stub gaps")
+        terminalreporter.write_line(summary.stub_gaps)
     terminalreporter.section("eval results")
     for path in summary.files:
         terminalreporter.write_line(str(path))
