@@ -1,4 +1,5 @@
-"""What an eval session runs with: the provider, the models, N and the minimum."""
+"""What an eval session runs with: the provider, the models, N, the minimum, and whether
+each case also runs without its skill (the baseline)."""
 
 import tomllib
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ class EvalConfig:
     runs: int  # runs per golden case
     min_passes: int  # runs that must pass for a metric to pass the case
     vertex: Vertex | None = None  # with the Vertex backend
+    baseline: bool = False  # each case also runs N times without its skill
     plugins_dir: Path = PLUGINS_DIR
     logs_dir: Path = RUNS_DIR / "unnamed"
 
@@ -40,6 +42,7 @@ class EvalConfig:
         min_passes: int,
         model: str | None = None,
         judge_model: str | None = None,
+        baseline: bool = False,
         models_file: Path = MODELS_FILE,
     ) -> EvalConfig:
         """A session's configuration. Without `model` or `judge_model`, the ones pinned
@@ -63,6 +66,7 @@ class EvalConfig:
             runs=runs,
             min_passes=min_passes,
             vertex=vertex,
+            baseline=baseline,
             logs_dir=RUNS_DIR / datetime.now().strftime("%Y%m%d-%H%M%S"),
         )
 

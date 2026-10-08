@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 
+from marketplace_evals.goldens import GoldenCheck
 from marketplace_evals.sandbox import Sandbox, changed_files
 from marketplace_evals.trace import Trace
 
@@ -20,6 +21,9 @@ class AgentTask:
     fixture_dir: Path  # what the agent will see as its repo, plus an optional setup.sh
     tools: tuple[str, ...]  # what the agent may use, in the goldens' vocabulary
     inspect: tuple[str, ...] = ()  # commands whose output the judge sees
+    before: tuple[str, ...] = ()  # commands that record state for the checks, before the agent
+    checks: tuple[GoldenCheck, ...] = ()  # run after the agent, before the sandbox is deleted
+    without_skill: str | None = None  # a baseline run: this skill is left out of the plugin
 
 
 class Runner(ABC):
@@ -45,14 +49,17 @@ class Runner(ABC):
 
     def run(self, task: AgentTask, root: Path) -> Trace:
         """Run the task in `root` (empty and disposable) and return the trace."""
-        sandbox = Sandbox.create(root, task.fixture_dir, task.plugin_dir)
+        sandbox = Sandbox.create(root, task.fixture_dir, task.plugin_dir, task.without_skill)
+        sandbox.prepare(task.before)
         initial_files = sandbox.snapshot()
         initial_state = sandbox.inspect(task.inspect)
         trace = self._launch(task, sandbox)
+        trace.prompt = task.prompt
         trace.final_files = sandbox.snapshot()
         trace.changed_files = changed_files(trace.final_files, initial_files)
         trace.initial_state = initial_state
         trace.final_state = sandbox.inspect(task.inspect)
+        trace.check_runs = sandbox.run_checks(task.checks)
         self._keep(trace, sandbox)
         return trace
 
@@ -78,8 +85,20 @@ class Runner(ABC):
             path = kept / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
-        if trace.final_state:
+        if trace.final_state or trace.check_runs:
             self.logs_dir.mkdir(parents=True, exist_ok=True)
             (self.logs_dir / f"{sandbox.root.name}.state.txt").write_text(
-                f"== before\n{trace.initial_state}\n\n== after\n{trace.final_state}\n"
+                f"== before\n{trace.initial_state}\n\n== after\n{trace.final_state}\n" + _checks_text(trace)
             )
+
+
+def _checks_text(trace: Trace) -> str:
+    """Each check's result, with the output of those that failed."""
+    if not trace.check_runs:
+        return ""
+    lines = ["", "== checks"]
+    for run in trace.check_runs.values():
+        lines.append(f"[{'x' if run.passed else ' '}] {run.name}")
+        if not run.passed:
+            lines.append(f"    exit {run.exit_code}" + (f": {run.output}" if run.output else ""))
+    return "\n".join(lines) + "\n"

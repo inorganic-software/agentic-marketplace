@@ -11,6 +11,9 @@ class Check:
     description: str  # for people: may include run-specific detail (judge reason, calls)
     passed: bool
     key: str | None = None  # stable across runs, to compare them; defaults to description
+    # Whether missing it fails the run on its own: a criterion of `expected_outcome`. None
+    # where the metric has no such distinction.
+    required: bool | None = None
 
     @property
     def id(self) -> str:
@@ -28,7 +31,12 @@ class MetricResult:
 
     @property
     def passed(self) -> bool:
-        return self.error is None and self.score >= self.threshold
+        return self.error is None and self.score >= self.threshold and not self.missed_required
+
+    @property
+    def missed_required(self) -> list[Check]:
+        """The required checks it missed: any of them fails the run, whatever the score."""
+        return [c for c in self.checks if c.required and not c.passed]
 
 
 def failed(name: str, threshold: float, error: str) -> MetricResult:

@@ -47,9 +47,23 @@ class ToolCall:
         return f"{self.by}: {self.action}({args}){flag}"
 
 
+@dataclass(frozen=True)
+class CheckRun:
+    """A golden's check, run in the workspace after the agent."""
+
+    name: str
+    exit_code: int  # passes with 0; a timeout is not 0
+    output: str  # what it printed, normalized and cut short, to see why it failed
+
+    @property
+    def passed(self) -> bool:
+        return self.exit_code == 0
+
+
 @dataclass
 class Trace:
     runtime: str
+    prompt: str = ""  # what the agent was asked: the variant of the case's prompts this run got
     calls: list[ToolCall] = field(default_factory=list)
     final_output: str = ""
     models: dict[str, set[str]] = field(default_factory=dict)  # agent -> models used
@@ -61,6 +75,7 @@ class Trace:
     # Output of the golden's `inspect` commands before and after the agent (git state...).
     initial_state: str = ""
     final_state: str = ""
+    check_runs: dict[str, CheckRun] = field(default_factory=dict)  # the golden's checks, by name
     raw_log: str | None = None  # path to the runtime's raw log, for debugging
     usage: Usage = field(default_factory=Usage)  # tokens, cost and time of the whole run
 

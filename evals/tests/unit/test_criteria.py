@@ -1,8 +1,9 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
-from marketplace_evals.goldens import GoldenCase
-from marketplace_evals.metrics import outcome, rules
+from marketplace_evals.goldens import Criterion, GoldenCase, PromptVariant
+from marketplace_evals.metrics import outcome, rules_always_met_judged
 from marketplace_evals.runtimes import Judge, JudgeError
 from marketplace_evals.trace import Trace
 
@@ -30,11 +31,15 @@ CASE = GoldenCase(
     "commons",
     "git-workflow",
     Path("f"),
-    "Commitea esto",
+    (PromptVariant("directo", "Commitea esto"),),
     [],
     [],
-    expected_outcome=["The branch is feat/...", "The message is conventional", "main is untouched"],
-    rules=["No commit lands on main", "main is never force-pushed"],
+    expected_outcome=[
+        Criterion("The branch is feat/..."),
+        Criterion("The message is conventional"),
+        Criterion("main is untouched"),
+    ],
+    rules_always_met_judged=["No commit lands on main", "main is never force-pushed"],
 )
 INSPECTED = GoldenCase(**{**CASE.__dict__, "inspect": ["git log --oneline"]})
 
@@ -46,6 +51,7 @@ def trace(changed: bool = True, initial_state: str = "", final_state: str = "") 
     }
     return Trace(
         runtime="test",
+        prompt="Commitea esto",
         final_output="Done",
         final_files=files,
         changed_files=["src/app.py"] if changed else [],
@@ -66,6 +72,64 @@ def test_outcome_passes_with_at_most_one_miss():
     assert [c.passed for c in result.checks] == [True, False, True]
     assert "reason 2" in result.checks[1].description
     assert not outcome(CASE, trace(), FakeJudge(answer(False, False, True))).passed
+
+
+def test_outcome_with_a_single_criterion_must_meet_it():
+    """One tolerated miss of one criterion would let every run pass."""
+    single = GoldenCase(**{**CASE.__dict__, "expected_outcome": [Criterion("The description is imperative")]})
+    assert outcome(single, trace(), FakeJudge(answer(True))).passed
+    result = outcome(single, trace(), FakeJudge(answer(False)))
+    assert not result.passed
+    assert result.threshold == 1.0
+
+
+MIXED = GoldenCase(
+    **{
+        **CASE.__dict__,
+        "expected_outcome": [
+            Criterion("The conflict was resolved by intent", required=True),
+            Criterion("The description is imperative"),
+            Criterion("The scope names the module"),
+        ],
+    }
+)
+
+
+def test_a_missed_required_criterion_fails_the_run_even_if_it_is_the_only_miss():
+    result = outcome(MIXED, trace(), FakeJudge(answer(False, True, True)))
+    assert not result.passed
+    assert result.score >= result.threshold  # one miss would be tolerated if it were optional
+    assert result.missed_required == [result.checks[0]]
+
+
+def test_with_the_required_criteria_met_one_optional_miss_is_tolerated_and_two_are_not():
+    assert outcome(MIXED, trace(), FakeJudge(answer(True, False, True))).passed
+    assert not outcome(MIXED, trace(), FakeJudge(answer(True, False, False))).passed
+
+
+def test_one_required_and_one_optional_tolerates_missing_the_optional():
+    pair = GoldenCase(**{**CASE.__dict__, "expected_outcome": MIXED.expected_outcome[:2]})
+    assert outcome(pair, trace(), FakeJudge(answer(True, False))).passed
+    assert not outcome(pair, trace(), FakeJudge(answer(False, True))).passed
+
+
+def test_required_criteria_are_marked_in_the_report_but_not_for_the_judge():
+    judge = FakeJudge(answer(True, True, True))
+    result = outcome(MIXED, trace(), judge)
+    assert "[required]" not in judge.prompts[0]
+    assert result.checks[0].description.startswith("[required] The conflict was resolved by intent — ")
+    assert [(c.key, c.required) for c in result.checks] == [
+        ("The conflict was resolved by intent", True),
+        ("The description is imperative", False),
+        ("The scope names the module", False),
+    ]
+
+
+def test_judged_rules_do_not_tell_required_from_optional():
+    """Every rule must be met: their checks are neither marked nor counted as required."""
+    result = rules_always_met_judged(CASE, trace(), FakeJudge(answer(True, True)))
+    assert [c.required for c in result.checks] == [None, None]
+    assert not any(c.description.startswith("[required]") for c in result.checks)
 
 
 def test_judge_sees_the_task_every_file_marked_the_message_and_the_criteria():
@@ -116,16 +180,23 @@ def test_answer_missing_a_criterion_is_a_judge_error():
     assert result.error.startswith("JUDGE ERROR:")
 
 
-def test_rules_needs_every_rule():
-    assert rules(CASE, trace(), FakeJudge(answer(True, True))).passed
-    assert not rules(CASE, trace(), FakeJudge(answer(True, False))).passed
+def test_rules_always_met_judged_needs_every_rule():
+    assert rules_always_met_judged(CASE, trace(), FakeJudge(answer(True, True))).passed
+    assert not rules_always_met_judged(CASE, trace(), FakeJudge(answer(True, False))).passed
 
 
-def test_rules_are_judged_even_when_the_agent_changed_nothing():
+def test_rules_always_met_judged_are_judged_even_when_the_agent_changed_nothing():
     # In a trap, changing nothing is right; and what was already there counts.
     judge = FakeJudge(answer(False, True))
-    result = rules(CASE, trace(changed=False), judge)
+    result = rules_always_met_judged(CASE, trace(changed=False), judge)
     assert not result.passed
     assert result.error is None
     assert "--- src/app.py (unchanged)" in judge.prompts[0]
     assert "1. No commit lands on main\n2. main is never force-pushed" in judge.prompts[0]
+
+
+def test_judge_sees_the_variant_the_run_got_not_the_first_one():
+    judge = FakeJudge(answer(True, True, True))
+    case = replace(CASE, prompts=(*CASE.prompts, PromptVariant("coloquial", "commitea esto porfa")))
+    outcome(case, replace(trace(), prompt="commitea esto porfa"), judge)
+    assert "Task given to the agent:\ncommitea esto porfa\n" in judge.prompts[0]

@@ -63,6 +63,10 @@
   tr.diff > th:first-child { background: var(--diff); box-shadow: inset 3px 0 var(--diff-bar); }
   td.missing { background: var(--missing); color: var(--muted); }
   .score, .errors { display: block; font-size: 12px; color: var(--muted); }
+  .required { font-size: 12px; color: var(--muted); }
+  .baseline { display: block; font-size: 12px; color: var(--muted); }
+  tr.skill th { font-weight: normal; padding-left: 22px; }
+  tr.efficiency th { font-weight: normal; padding-left: 22px; color: var(--muted); }
   .errors { color: #c0392b; }
   .star { color: var(--star); margin-left: 4px; }
   .legend { color: var(--muted); font-size: 12px; font-weight: normal; }
@@ -118,7 +122,7 @@ function el(tag, attrs = {}, ...children) {
 }
 
 // Comparable value of a cell, so that "differs" and "best" agree with what is shown.
-const cellKey = c => (c === null ? null : JSON.stringify([c.passed, c.total, c.score ?? null, c.verdict ?? null]));
+const cellKey = c => (c === null ? null : JSON.stringify([c.passed, c.total, c.required ?? null, c.score ?? null, c.verdict ?? null, c.informative ?? null, c.baseline ?? null]));
 const cellRank = c => [c.rate ?? -1, c.score ?? -1];
 
 // A metric or check differs if the shown sessions that have it got different results;
@@ -179,11 +183,49 @@ function addSlot() {
 function valueCell(c, star) {
   if (c === null) return el("td", { class: "value missing" }, "–");
   const td = el("td", { class: "value", style: `background:${colorOf(c.rate)}` });
-  td.append(c.verdict === undefined ? "" : c.verdict ? "✅ " : "❌ ", `${c.passed}/${c.total}`);
+  td.append(c.verdict === undefined ? "" : c.informative ? "ℹ️ " : c.verdict ? "✅ " : "❌ ", `${c.passed}/${c.total}`);
+  if (c.required != null) td.append(el("span", { class: "required", title: "Runs that had to pass" }, ` (${c.required} req.)`));
   if (star) td.append(el("span", { class: "star", title: "Best of the shown sessions" }, "★"));
+  if (c.baseline !== undefined) td.append(baselineNote(c));
   if (c.score !== undefined) td.append(el("span", { class: "score" }, c.score === null ? "no score" : `score ${c.score.toFixed(2)}`));
   if (c.errors) td.append(el("span", { class: "errors" }, `${c.errors} run${c.errors > 1 ? "s" : ""} with errors`));
   return td;
+}
+
+// Runs (or, for a check, scored runs) that passed without the skill, and the difference
+// in points with the skill, both leaving out what only the skill can pass.
+const points = d => { const p = Math.round(d * 100); return p ? `${p > 0 ? "+" : ""}${p} pp` : "0 pp"; };
+function baselineNote(c) {
+  if (c.baseline === null) {
+    return el("span", { class: "baseline", title: "Only a run with the skill can pass it" }, "w/o –");
+  }
+  const b = c.baseline;
+  const delta = b.delta ?? (c.rate !== null && b.rate !== null ? c.rate - b.rate : null);
+  return el("span", { class: "baseline", title: "Without the skill, and the difference with it" },
+    `w/o ${b.passed}/${b.total}` + (delta === null ? "" : ` · Δ ${points(delta)}`));
+}
+
+// Whether the golden case passes without its skill, in the sessions with a baseline.
+function skillRow(cells) {
+  const text = b => (b === null ? null : b.without ? "✅ passes ⚠" : "❌ fails");
+  const { differs, shown } = rowFlags(cells.map(text));
+  return el("tr", { class: `skill${state.diffs && differs ? " diff" : ""}` },
+    el("th", { title: "On the metrics that can be scored without the skill. A case that passes without it does not measure it." },
+      "without skill"),
+    shown.map(t => (t === null ? el("td", { class: "value missing" }, "–") : el("td", { class: "value" }, t))),
+    padCells());
+}
+
+// A measure of what the runs spent: the median per run, and with a baseline, without the
+// skill and the difference. No colour or star: spending less is not always better.
+function efficiencyRow(row) {
+  const { differs, shown } = rowFlags(row.cells.map(c => (c === null ? null : `${c.text}|${c.note ?? ""}`)));
+  return el("tr", { class: `efficiency${state.diffs && differs ? " diff" : ""}` },
+    el("th", { title: "Median per run, over the runs without errors" }, `efficiency · ${row.name}`),
+    state.order.map(i => row.cells[i]).map(c => (c === null
+      ? el("td", { class: "value missing" }, "–")
+      : el("td", { class: "value" }, c.text, c.note ? el("span", { class: "baseline" }, c.note) : null))),
+    padCells());
 }
 
 function dataRow(cls, labelNode, cells, onclick) {
@@ -219,12 +261,19 @@ function visibleGoldens() {
         .filter(m => (!state.metric || m.name === state.metric) && inShown(m))
         .map(m => {
           const own = m.checks.filter(inShown);
-          if (!q || has(g.id) || has(m.name)) return { ...m, checks: own, shownChecks: own, forced: false };
+          // A variant row only if some shown session ran it, and only with several variants.
+          const variants = (m.variants ?? []).filter(inShown);
+          const shownVariants = variants.length > 1 ? variants : [];
+          if (!q || has(g.id) || has(m.name)) return { ...m, checks: own, shownChecks: own, shownVariants, forced: false };
           const checks = own.filter(c => has(c.id));
-          return checks.length ? { ...m, checks: own, shownChecks: checks, forced: true } : null;
+          return checks.length ? { ...m, checks: own, shownChecks: checks, shownVariants: [], forced: true } : null;
         })
         .filter(Boolean);
-      return metrics.length ? { ...g, shownMetrics: metrics } : null;
+      // Efficiency rows show with no metric picked, or with "efficiency" picked.
+      const efficiency = (!state.metric || state.metric === "efficiency")
+        ? (g.efficiency ?? []).filter(r => inShown(r) && (!q || has(g.id) || has("efficiency") || has(r.name)))
+        : [];
+      return metrics.length || efficiency.length ? { ...g, shownMetrics: metrics, shownEfficiency: efficiency } : null;
     })
     .filter(Boolean);
 }
@@ -243,7 +292,11 @@ function render() {
     state.order.map(() => el("col")), Array.from({ length: pad }, () => el("col"))));
   table.append(el("thead", {}, el("tr", {},
     el("th", {}, el("div", { class: "legend" },
-      "Passed runs out of N per metric, passed out of scored per check. ★ best of the shown sessions.")),
+      "Passed runs out of N per metric (and how many had to pass: all of them for prohibitions), passed out of scored per check. ★ best of the shown sessions. " +
+      "ℹ️ a metric of an informative case: it never fails the session. " +
+      "↳ prompt: the runs of one prompt variant of the case. " +
+      "efficiency: the median per run of what the runs spent. " +
+    "With a baseline, w/o: passed without the skill, and Δ: the difference.")),
     state.order.map(card), Array.from({ length: pad }, addSlot))));
 
   const body = el("tbody");
@@ -270,14 +323,22 @@ function render() {
     const [head, open] = sectionRow(g.id, g.id, el("span", { class: "plugin" }, g.plugin ?? ""));
     body.append(head);
     if (!open) continue;
+    if (state.order.some(i => g.baseline[i] !== null)) body.append(skillRow(g.baseline));
     for (const m of g.shownMetrics) {
       const key = `${g.id}\n${m.name}`;
       const mOpen = m.forced || state.openMetrics.has(key);
       const toggle = () => { state.openMetrics.has(key) ? state.openMetrics.delete(key) : state.openMetrics.add(key); render(); };
-      body.append(dataRow("metric", el("span", {}, el("span", { class: "caret" }, m.checks.length ? (mOpen ? "▾" : "▸") : ""), m.name),
+      const expandable = m.checks.length || m.shownVariants.length;
+      body.append(dataRow("metric", el("span", {}, el("span", { class: "caret" }, expandable ? (mOpen ? "▾" : "▸") : ""), m.name),
                           m.cells, toggle));
-      if (mOpen) for (const c of m.shownChecks) body.append(dataRow("check", c.id, c.cells));
+      if (mOpen) for (const v of m.shownVariants) {
+        body.append(dataRow("check variant", el("span", { title: "Runs that got this prompt variant" }, "↳ prompt ", el("b", {}, v.id)), v.cells));
+      }
+      if (mOpen) for (const c of m.shownChecks) {
+        body.append(dataRow("check", c.required ? el("span", {}, el("b", {}, "[required] "), c.id) : c.id, c.cells));
+      }
     }
+    for (const r of g.shownEfficiency) body.append(efficiencyRow(r));
   }
   if (!goldens.length) {
     body.append(el("tr", {}, el("td", { class: "empty", colspan: 1 + state.order.length + pad }, "No golden matches the filters.")));
@@ -288,6 +349,7 @@ function render() {
 function setup() {
   const plugins = [...new Set(DATA.goldens.map(g => g.plugin).filter(Boolean))].sort();
   const metrics = [...new Set(DATA.goldens.flatMap(g => g.metrics.map(m => m.name)))].sort();
+  if (DATA.goldens.some(g => (g.efficiency ?? []).length)) metrics.push("efficiency");
   document.getElementById("plugin").append(...plugins.map(a => el("option", { value: a }, a)));
   document.getElementById("metric").append(...metrics.map(m => el("option", { value: m }, m)));
 

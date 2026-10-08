@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from marketplace_evals.goldens import GoldenCase
+from marketplace_evals.goldens import GoldenCase, PromptVariant
 from marketplace_evals.matchers import AnyOf, CallMatcher
-from marketplace_evals.metrics import tool_correctness
+from marketplace_evals.metrics import expected_calls, forbidden_calls
 from marketplace_evals.trace import ToolCall, Trace
 
 CASE = GoldenCase(
@@ -10,7 +10,7 @@ CASE = GoldenCase(
     plugin="p",
     skill="s",
     fixture_dir=Path("f"),
-    prompt="p",
+    prompts=(PromptVariant("v", "p"),),
     expected_calls=[
         CallMatcher("read_file", {"path": "src/x.java"}),
         CallMatcher("shell", {"command": "*mvn*"}),
@@ -24,33 +24,33 @@ def trace(*calls: ToolCall) -> Trace:
 
 
 def test_all_checks_pass():
-    result = tool_correctness(
-        CASE,
-        trace(
-            ToolCall("read_file", {"path": "src/x.java"}, "Read"),
-            ToolCall("shell", {"command": "mvn compile"}, "Bash", denied=True),
-        ),
+    calls = trace(
+        ToolCall("read_file", {"path": "src/x.java"}, "Read"),
+        ToolCall("shell", {"command": "mvn compile"}, "Bash", denied=True),
     )
-    assert result.score == 1.0
-    assert result.passed
+    for result in (expected_calls(CASE, calls), forbidden_calls(CASE, calls)):
+        assert result.score == 1.0
+        assert result.passed
 
 
 def test_missing_expected_call_fails():
-    result = tool_correctness(CASE, trace(ToolCall("read_file", {"path": "src/x.java"}, "Read")))
-    assert result.score == 3 / 4
+    result = expected_calls(CASE, trace(ToolCall("read_file", {"path": "src/x.java"}, "Read")))
+    assert result.name == "expected_calls"
+    assert result.score == 1 / 2
     assert not result.passed
 
 
-def test_forbidden_call_fails():
-    result = tool_correctness(
-        CASE,
-        trace(
-            ToolCall("read_file", {"path": "src/x.java"}, "Read"),
-            ToolCall("shell", {"command": "mvn compile"}, "Bash"),
-            ToolCall("read_file", {"path": "@plugins/p/skills/s/SKILL.md"}, "Read"),
-        ),
+def test_forbidden_call_fails_only_forbidden_calls():
+    calls = trace(
+        ToolCall("read_file", {"path": "src/x.java"}, "Read"),
+        ToolCall("shell", {"command": "mvn compile"}, "Bash"),
+        ToolCall("read_file", {"path": "@plugins/p/skills/s/SKILL.md"}, "Read"),
     )
-    assert [c.passed for c in result.checks] == [True, True, True, False]
+    result = forbidden_calls(CASE, calls)
+    assert result.name == "forbidden_calls"
+    assert [c.passed for c in result.checks] == [True, False]
+    assert not result.passed
+    assert expected_calls(CASE, calls).passed
 
 
 def test_matcher_without_args_matches_any_call_of_that_action():
@@ -85,6 +85,6 @@ def test_any_of_passes_with_either_matcher():
 
 
 def test_forbidden_check_shows_the_offending_calls():
-    result = tool_correctness(CASE, trace(*[ToolCall("edit_file", {"path": f"f{i}"}, "Edit") for i in range(5)]))
-    forbidden = result.checks[2].description
+    result = forbidden_calls(CASE, trace(*[ToolCall("edit_file", {"path": f"f{i}"}, "Edit") for i in range(5)]))
+    forbidden = result.checks[0].description
     assert "main: edit_file(path='f0')" in forbidden and "+2 more" in forbidden

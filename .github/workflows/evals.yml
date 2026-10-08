@@ -2,15 +2,27 @@ name: Evals
 
 # Runs the behavioral evals (evals/README.md) on Copilot CLI with Vertex AI
 # models when a PR changes the plugins or the evals. Informative: a case below
-# --min-passes turns the job red, but it is not a required check. Results go to
+# --min-passes turns the job red (the quality metrics of an `informative` case
+# never do), but it is not a required check. Results go to
 # the job summary, a PR comment updated on every push, and an artifact with the
 # logs, final files and state of every run.
+#
+# With the `evals:baseline` label on the PR, or `baseline` checked when it is run by
+# hand, each case also runs without its skill, to see what the skill adds. It doubles
+# the cost, so it only runs on demand. Adding the label starts a new run.
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - plugins/**
       - evals/**
       - .github/workflows/evals.yml
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: Also run each case without its skill
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -18,15 +30,18 @@ permissions:
 # A new push cancels the evals still running for the previous one, so they
 # stop spending.
 concurrency:
-  group: evals-${{ github.event.pull_request.number }}
+  group: evals-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   evals:
     name: evals
     # PRs from forks get no OIDC token for this repo, so they could not sign in
-    # to Google Cloud.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    # to Google Cloud. Of the labels, only `evals:baseline` starts a run.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       (github.event.action != 'labeled' || github.event.label.name == 'evals:baseline'))
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -73,7 +88,14 @@ jobs:
         run: uv sync --locked
 
       - name: Run evals
-        run: uv run pytest -m eval -s --provider copilot --backend vertex --runs 3 --min-passes 2
+        env:
+          BASELINE: ${{ inputs.baseline || contains(github.event.pull_request.labels.*.name, 'evals:baseline') }}
+        run: |
+          args=(--provider copilot --backend vertex --runs 3 --min-passes 2)
+          if [[ "$BASELINE" == true ]]; then
+            args+=(--baseline)
+          fi
+          uv run pytest -m eval -s "${args[@]}"
 
       - name: Build report
         id: report
@@ -103,7 +125,7 @@ jobs:
           fi
 
       - name: Comment on the PR
-        if: ${{ !cancelled() && steps.report.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.report.outcome == 'success' && github.event_name == 'pull_request' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}

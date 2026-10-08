@@ -5,18 +5,21 @@ by the agent or unchanged, so it can also check what should stay as it was), the
 of the golden's `inspect` commands before and after the agent (the git history, say)
 and the agent's final message, and answers each criterion yes or no with a reason.
 There are no weights: the score is the fraction met, and the run passes if it misses
-at most `max_misses`.
+at most `max_misses`, none of them required, and never if it misses them all.
 
 Two metrics share it, so that each one answers one question:
-  - rules: the golden's `rules`, the absolute prohibitions of the skill, shared by
-    every case. All must be met. Judged even if the agent changed nothing: in a trap
+  - rules_always_met_judged: the golden's `rules_always_met_judged`, the absolute
+    prohibitions of the skill that need judgment, shared by every case. All must be met. Judged even if the agent changed nothing: in a trap
     that is the right behavior, and what was already there counts.
-  - outcome: `expected_outcome`, what the skill asks for in that case.
+  - outcome: `expected_outcome`, what the skill asks for in that case. One miss of an
+    optional criterion is tolerated, unless there is a single criterion; a required one
+    must be met. The judge is not told which are required: it changes how the answers
+    are counted, not the question.
 """
 
 import json
 
-from marketplace_evals.goldens import GoldenCase
+from marketplace_evals.goldens import Criterion, GoldenCase
 from marketplace_evals.metrics.base import Check, MetricResult, failed, with_judge_retry
 from marketplace_evals.runtimes.judge import Judge, JudgeError
 from marketplace_evals.runtimes.process import excerpt
@@ -76,32 +79,36 @@ SCHEMA = {
 }
 
 
-def rules(case: GoldenCase, trace: Trace, judge: Judge) -> MetricResult:
-    return judge_criteria("rules", case.rules, 0, case, trace, judge, require_changes=False)
+def rules_always_met_judged(case: GoldenCase, trace: Trace, judge: Judge) -> MetricResult:
+    rules = [Criterion(rule) for rule in case.rules_always_met_judged]  # all must be met: no misses
+    return judge_criteria("rules_always_met_judged", rules, 0, case, trace, judge, require_changes=False)
 
 
 def outcome(case: GoldenCase, trace: Trace, judge: Judge) -> MetricResult:
-    return judge_criteria("outcome", case.expected_outcome, 1, case, trace, judge)
+    return judge_criteria("outcome", case.expected_outcome, 1, case, trace, judge, marks_required=True)
 
 
 def judge_criteria(
     name: str,
-    criteria: list[str],
+    criteria: list[Criterion],
     max_misses: int,
     case: GoldenCase,
     trace: Trace,
     judge: Judge,
     require_changes: bool = True,
+    marks_required: bool = False,  # its checks say whether each is required (`expected_outcome`)
 ) -> MetricResult:
+    # A tolerated miss must leave something to meet: with one criterion, it must be met.
+    max_misses = min(max_misses, len(criteria) - 1)
     threshold = (len(criteria) - max_misses) / len(criteria)
     if require_changes and not trace.changed:
         return failed(name, threshold, "the agent changed no file and nothing its golden inspects")
     prompt = PROMPT.format(
-        prompt=case.prompt,
+        prompt=trace.prompt,
         files=_files(trace) or "(none)",
         state=STATE.format(initial_state=trace.initial_state, final_state=trace.final_state) if case.inspect else "",
         final_output=trace.final_output or "(none)",
-        criteria="\n".join(f"{i}. {c}" for i, c in enumerate(criteria, 1)),
+        criteria="\n".join(f"{i}. {c.text}" for i, c in enumerate(criteria, 1)),
     )
 
     def measure() -> MetricResult:
@@ -113,7 +120,13 @@ def judge_criteria(
         if sorted(answers) != list(range(1, len(criteria) + 1)):
             raise JudgeError(f"answer does not cover criteria 1..{len(criteria)}: {excerpt(raw)}")
         checks = [
-            Check(f"{c} — {answers[i]['reason']}", bool(answers[i]["met"]), key=c) for i, c in enumerate(criteria, 1)
+            Check(
+                f"{'[required] ' if c.required else ''}{c.text} — {answers[i]['reason']}",
+                bool(answers[i]["met"]),
+                key=c.text,
+                required=c.required if marks_required else None,
+            )
+            for i, c in enumerate(criteria, 1)
         ]
         return MetricResult(name, sum(c.passed for c in checks) / len(checks), threshold, checks)
 

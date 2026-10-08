@@ -3,6 +3,7 @@
     <root>/
     ├── workspace/            the agent's working directory, made from the fixture
     ├── plugins/<plugin>/     a copy of the plugin, so the agent cannot change the real one
+    │                         (without the skill under evaluation, in a baseline run)
     ├── bin/                  first in the PATH, for stubs a fixture installs (`gh`...)
     └── .gitconfig            git's global configuration, instead of the user's
 
@@ -15,12 +16,18 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from marketplace_evals.trace import PLUGINS_PREFIX, SANDBOX_PREFIX
+from marketplace_evals.goldens import GoldenCheck
+from marketplace_evals.trace import PLUGINS_PREFIX, SANDBOX_PREFIX, CheckRun
 
 # A fixture's setup script: run in the workspace before the agent, never copied into it.
 SETUP_SCRIPT = "setup.sh"
 SETUP_TIMEOUT_S = 120
 INSPECT_TIMEOUT_S = 60
+CHECK_TIMEOUT_S = 60
+# How `before` commands and checks run: a check of several lines fails at the first
+# that fails, not only by the last one, and a pipeline by any of its commands.
+SHELL = ["bash", "-e", "-o", "pipefail", "-c"]
+CHECK_OUTPUT_CHARS = 500  # of a check's output, kept to see why it failed
 
 # Never part of the agent's work as files: git's own database. What the agent did with
 # git is shown to the judge through the golden's `inspect` commands instead.
@@ -41,7 +48,7 @@ GITCONFIG = """\
 
 
 class SetupError(RuntimeError):
-    """A fixture's setup script failed: the run cannot start."""
+    """A fixture's setup script or a golden's `before` command failed: the run cannot start."""
 
 
 @dataclass(frozen=True)
@@ -66,12 +73,19 @@ class Sandbox:
         return self.root / "bin"
 
     @classmethod
-    def create(cls, root: Path, fixture_dir: Path, plugin_dir: Path) -> Sandbox:
+    def create(cls, root: Path, fixture_dir: Path, plugin_dir: Path, without_skill: str | None = None) -> Sandbox:
         """The fixture as the workspace, a copy of the plugin, and the fixture's setup
-        script run in the workspace. `fixture_dir` and `plugin_dir` are left untouched."""
+        script run in the workspace. `fixture_dir` and `plugin_dir` are left untouched.
+        With `without_skill`, that skill is removed from the copy: the rest of the plugin
+        stays loaded, as a user without the skill would have it."""
         sandbox = cls(root, plugin_dir.name)
         shutil.copytree(fixture_dir, sandbox.workspace, ignore=shutil.ignore_patterns(SETUP_SCRIPT))
         shutil.copytree(plugin_dir, sandbox.plugin_dir)
+        if without_skill is not None:
+            skill_dir = sandbox.plugin_dir / "skills" / without_skill
+            if not skill_dir.is_dir():
+                raise SetupError(f"{plugin_dir} has no skill {without_skill!r} to leave out")
+            shutil.rmtree(skill_dir)
         sandbox.bin.mkdir()
         (root / ".gitconfig").write_text(GITCONFIG)
         if (setup := fixture_dir / SETUP_SCRIPT).is_file():
@@ -103,6 +117,26 @@ class Sandbox:
             text=True,
             timeout=timeout,
         )
+
+    def prepare(self, commands: tuple[str, ...]) -> None:
+        """Run the golden's `before` commands, which record state for the checks."""
+        for command in commands:
+            proc = self.run([*SHELL, command], timeout=SETUP_TIMEOUT_S)
+            if proc.returncode != 0:
+                output = self.normalize((proc.stderr or proc.stdout).strip())[:500]
+                raise SetupError(f"before command {command!r} exited with code {proc.returncode}: {output}")
+
+    def run_checks(self, checks: tuple[GoldenCheck, ...]) -> dict[str, CheckRun]:
+        """Run each check in the workspace. A check that times out does not pass."""
+        runs = {}
+        for check in checks:
+            try:
+                proc = self.run([*SHELL, check.run], timeout=CHECK_TIMEOUT_S)
+                exit_code, output = proc.returncode, (proc.stdout + proc.stderr).strip()
+            except subprocess.TimeoutExpired:
+                exit_code, output = -1, f"timed out after {CHECK_TIMEOUT_S}s"
+            runs[check.name] = CheckRun(check.name, exit_code, self.normalize(output)[:CHECK_OUTPUT_CHARS])
+        return runs
 
     def inspect(self, commands: tuple[str, ...]) -> str:
         """The output of each command, as `$ command` followed by what it printed."""

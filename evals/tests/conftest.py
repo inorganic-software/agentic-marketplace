@@ -36,6 +36,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
     group.addoption("--runs", type=int, default=3, help="Runs per golden case")
     group.addoption("--min-passes", type=int, default=2, help="Runs that must pass for a metric to pass the case")
+    group.addoption(
+        "--baseline",
+        action="store_true",
+        help="Also run each case --runs times without its skill, and report what the skill adds "
+        "(informative: it never fails a test). Doubles the cost",
+    )
 
 
 @pytest.fixture(scope="session")
@@ -49,6 +55,7 @@ def eval_session(pytestconfig: pytest.Config) -> EvalSession:
             min_passes=option("--min-passes"),
             model=option("--model"),
             judge_model=option("--judge-model"),
+            baseline=option("--baseline"),
         )
     except ConfigError as e:
         raise pytest.UsageError(str(e)) from e
@@ -61,10 +68,16 @@ def pytest_terminal_summary(terminalreporter, config: pytest.Config) -> None:
     if session is None or not session.started:  # no eval ran (e.g. only unit tests)
         return
     summary = session.finish()
-    terminalreporter.section("eval turns")
-    terminalreporter.write_line(summary.turns)
+    terminalreporter.section("eval efficiency")
+    terminalreporter.write_line(summary.efficiency)
     terminalreporter.section("eval usage")
     terminalreporter.write_line(summary.usage)
+    if summary.baseline is not None:
+        terminalreporter.section("eval baseline")
+        terminalreporter.write_line(summary.baseline)
+    if summary.skill_loading is not None:
+        terminalreporter.section("eval skill loading")
+        terminalreporter.write_line(summary.skill_loading)
     terminalreporter.section("eval results")
     for path in summary.files:
         terminalreporter.write_line(str(path))

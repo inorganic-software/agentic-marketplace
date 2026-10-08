@@ -4,14 +4,24 @@ Behavioral evals for the skills of the plugins in `../plugins/`, designed to be 
 
 ```
 golden (YAML) ─► Runner (one adapter per runtime) ─► Canonical trace + final workspace ─► metrics ─► pytest
-                                                                                          ├─ tool_correctness  (deterministic)
-                                                                                          ├─ rules             (LLM judge, per criterion)
-                                                                                          └─ outcome           (LLM judge, per criterion)
+                                                                                          ├─ expected_calls           (deterministic)
+                                                                                          ├─ forbidden_calls          (deterministic, strict)
+                                                                                          ├─ rules_always_met         (deterministic, shell commands, strict)
+                                                                                          ├─ rules_always_met_judged  (LLM judge, per criterion, strict)
+                                                                                          ├─ outcome_checks           (deterministic, shell commands)
+                                                                                          ├─ outcome                  (LLM judge, per criterion)
+                                                                                          └─ skill_loading            (deterministic, the golden's skill_loading prompts)
 ```
 
 What is evaluated is how the agent works with the plugin loaded (whether it loads the skill on its own, which commands it runs, which it must never run) and what it leaves behind: the files of the workspace and, through each golden's `inspect` commands, any other state, such as the git history.
 
-Only `tool_correctness` is deterministic. Everything about the result is judged by an LLM against criteria written in the golden, so a new skill or a new rule in one only needs golden changes, not code. The cost is that those checks are not exact and add the judge's variability to the agent's.
+What can be checked exactly is checked with code: the calls in the trace (`expected_calls` and `forbidden_calls`) and shell commands the golden runs on the final state (`rules_always_met` and `outcome_checks`), such as a branch name against a regex or a clean working tree. Only what needs judgment (is a description imperative, was a conflict resolved by intent) goes to an LLM judge (`rules_always_met_judged` and `outcome`), which adds its own variability to the agent's. Either way, a new skill or a new rule in one only needs golden changes, not code.
+
+Besides the cases, each golden can list `skill_loading` prompts: some that should make the agent load the skill and some that should not. Each one only checks whether the skill's description makes the agent load it when it should, and only then. See [Skill loading](#skill-loading-does-the-description-load-it-when-it-should).
+
+The prohibitions (`forbidden_calls`, `rules_always_met` and `rules_always_met_judged`) are strict: every run must pass them (pass^k), since a user needs them kept every time. The rest pass a case with `--min-passes` of the `--runs` runs, and in a case marked `informative` they never fail the session: they measure what the agent does not do well yet. See [Informative cases](#informative-cases-what-the-agent-does-not-do-well-yet).
+
+With `--baseline`, each case also runs without its skill, to see what the skill adds: if a case passes without it, the case does not measure the skill. See [Baseline](#baseline-what-the-skill-adds).
 
 ## Layout: like tests in Java
 
@@ -38,26 +48,31 @@ runtimes/         what runs the agent and the judge, one package per runtime
   canonical.py      a runtime's tool call in the canonical vocabulary
   claude_code/      runner, judge and output parser of Claude Code
   copilot/          runner, judge, output parser, isolated environment and Vertex backend of Copilot CLI
-metrics/          tool_correctness, rules and outcome, and which cases each one scores
-evaluation.py     N runs per case, scored by each metric
-config.py         what a session runs with: provider, backend, models, N and the minimum
+metrics/          the calls, the checks, the judged rules and outcome, which cases each one scores and which are strict
+evaluation.py     N runs per case, scored by each metric, and the baseline without the skill
+config.py         what a session runs with: provider, backend, models, N, the minimum and the baseline
 session.py        a session's runs and results, and the files it leaves
 reporting/        terminal report, results.json, the PR comment and the comparison page
 ```
 
 - `runtimes/claude_code/` runs `claude -p` and `runtimes/copilot/` runs `copilot -p`, for the agent and for the judge. The judge runs with no tools, from an empty folder.
 - The metrics:
-  - `tool_correctness`: expected calls (loading the skill, a command the skill prescribes) and forbidden calls (a command the skill forbids, with `match` and `not_match`).
-  - `rules`: the judge answers each of the golden's `rules`, the skill's absolute prohibitions. Shared by every case, traps included. Every rule must be met. It is judged even if the agent changed nothing, and what was already there counts too.
-  - `outcome`: the judge answers each `expected_outcome` criterion yes or no, with a reason. No weights. Passes with at most one miss. Fails without judging if the agent changed no file and nothing its golden inspects.
+  - `expected_calls`: the case's expected calls (loading the skill, a command the skill prescribes). Every one must appear.
+  - `forbidden_calls`: the case's forbidden calls (a command the skill forbids, with `match` and `not_match`). None may appear.
+  - `rules_always_met`: the golden's `rules_always_met`, the skill's absolute prohibitions that can be checked exactly, written as what must always be true ("origin's main was not rewritten"). Shared by every case, traps included. Every check must pass. Run even if the agent changed nothing.
+  - `outcome_checks`: the case's `outcome_checks`, what the skill asks for in that case that can be checked exactly. Every check must pass. Fails without running them if the agent changed no file and nothing its golden inspects.
+  - A check is a shell command run in the workspace after the agent, with `bash -e -o pipefail` (a check of several lines fails at the first that fails) and the sandbox's environment, and passes if it exits with 0. It times out after 60 s. A failed check shows its exit code and the start of its output in the report and in `<run>.state.txt`.
+  - `rules_always_met_judged`: the judge answers each of the golden's `rules_always_met_judged`, the skill's absolute prohibitions that need judgment. Shared by every case, traps included. Every rule must be met. It is judged even if the agent changed nothing, and what was already there counts too.
+  - `outcome`: the judge answers each `expected_outcome` criterion yes or no, with a reason. No weights. A `required` criterion must be met; of the `optional` ones, one may be missed, unless it is the only criterion (a run never passes if it misses them all). The judge is not told which are required. Fails without judging if the agent changed no file and nothing its golden inspects.
+  - `skill_loading`: only on the golden's `skill_loading` prompts. A `should_load` prompt passes if the agent loads the skill under evaluation (with the skill tool, by its name, or by reading its `SKILL.md`), a `should_not_load` prompt if it does not.
   - If the judge fails, it is retried once. If it fails again, that run does not pass.
 - `uv run evals-report <results.json>`: the Markdown report of a session that CI posts on the PR.
-- `uv run evals-compare [folder | session | results.json ...] [-o out.html] [--open]`: a self-contained HTML page comparing sessions side by side, by default every session in `.runs/`, written to `.runs/compare.html`. You pick the sessions from a dropdown in each empty column. For each golden case and metric it shows the passed runs out of N and the mean score, unfolding into its checks; rows where the sessions differ are highlighted. Nothing says whether a difference is significant: with N=3 one run moves the rate a lot. A check reworded in the golden is a new row, since its text is its key.
+- `uv run evals-compare [folder | session | results.json ...] [-o out.html] [--open]`: a self-contained HTML page comparing sessions side by side, by default every session in `.runs/`, written to `.runs/compare.html`. You pick the sessions from a dropdown in each empty column. For each golden case and metric it shows the passed runs out of N, how many had to pass, and the mean score, unfolding into its checks; rows where the sessions differ are highlighted. Nothing says whether a difference is significant: with N=3 one run moves the rate a lot. A check reworded in the golden is a new row, since its text is its key. A required criterion of `outcome` shows as `[required]`. A session with a baseline also shows, in each cell, the runs that passed without the skill and the difference (`w/o 1/3 · Δ +67 pp`), and per golden whether the case passes without the skill. A case with several prompt variants unfolds each metric into a row per variant (`↳ prompt coloquial`), with and without the skill; checks are not broken down by variant. Each golden also has an `efficiency` row per measure (turns, tool calls, tokens, cost, time) with the median per run and, with a baseline, the median without the skill and the difference (`w/o 6 · Δ +3 (+50 %)`); sessions before schema 8 show `–`.
 - `models.toml`: the exact agent and judge model IDs, one section per provider and one for the Vertex backend. Every run checks the runtime really used them.
 - `.runs/<date>/`: one folder per eval session, git-ignored:
-  - `<run>.jsonl`, `<run>/` and `<run>.state.txt`: the raw log, the final files and the `inspect` output before and after, of each run.
-  - `results.json`: the session's structured results, to compare sessions over time (a skill change, a new model). For each case, metric and check, how many runs passed it, under a key that does not change between sessions. It also records the runtime and its version, the backend, the models, N and the minimum, the repo's commit and whether `plugins/` or `evals/` had uncommitted changes, and the usage.
-  - `summary.txt`: what pytest prints, which is lost when the terminal closes: every report with its checks and the judge's reasons, then the turns and usage tables.
+  - `<run>.jsonl`, `<run>/` and `<run>.state.txt`: the raw log, the final files, and the `inspect` output before and after with the result of each check, of each run. In a case with several prompt variants, `<run>` carries the variant's id (`<case>-coloquial-1-...`).
+  - `results.json`: the session's structured results, to compare sessions over time (a skill change, a new model). For each case, metric and check, how many runs passed it (and, per metric, how many had to: `required`, and `strict`), under a key that does not change between sessions. It also records the runtime and its version, the backend, the models, N and the minimum, the repo's commit and whether `plugins/` or `evals/` had uncommitted changes, and the usage. A `skill_loading` prompt is a case with `should_load`, and `skill_loading` sums them up per skill. Each case records whether it is `informative`, and each metric whether failing it is only reported (`informative`). Each check of `outcome` records whether it is `required` (schema 6). With `--baseline` (`config.baseline`), each metric also has a `baseline` block with the metric with and without the skill (`with_skill`, `without_skill`, both without what only the skill can pass) and their difference (`delta`), or `null` if only the skill can pass it; and each case, whether it passes with and without the skill. Each run of `per_run` records its prompt `variant`, and in a case with several, each metric records `variants` (`passes` and `runs` per variant) and its `baseline`, `variant_deltas` (schema 7). Each case records its `efficiency` (see [Efficiency](#efficiency-what-the-runs-spend)), and `usage.agent` leaves out the runs without the skill, which go to `usage.agent_without_skill` (schema 8).
+  - `summary.txt`: what pytest prints, which is lost when the terminal closes: every report with its checks and the judge's reasons (a required criterion of `outcome` marked `[required]`, and a run that missed one, `required criterion missed`), then the efficiency and usage tables.
 
 ## Goldens
 
@@ -65,12 +80,112 @@ One `golden.yaml` per skill. The format is in `src/marketplace_evals/goldens.py`
 
 - `tools`: what the agent may use, in Copilot's agent vocabulary (`read`, `edit`, `search`, `execute`). Each runner translates it. Loading skills is always allowed.
 - `inspect`: shell commands run in the workspace before and after the agent. The judge sees both outputs, for what a file snapshot does not show (a commit changes no file in the working tree).
-- `rules`: absolute prohibitions, judged in every case.
-- `cases`: each with `id`, `fixture`, `prompt`, and optionally `expected_calls`, `forbidden_calls` and `expected_outcome`.
+- `before`: shell commands run in the workspace after the fixture's setup and before the agent, to record in `$EVAL_SANDBOX` the state a check compares with (where `main` was, say). If one fails, the run does not start.
+- `rules_always_met`: absolute prohibitions that can be checked exactly, each with a `name` and a `run` command, checked in every case.
+- `rules_always_met_judged`: absolute prohibitions that need judgment, judged in every case. Plain texts, all of them required: `required:`/`optional:` is an error here.
+- `skill_loading`: a `fixture` and the prompts that `should_load` the skill and that `should_not_load` it. See [Skill loading](#skill-loading-does-the-description-load-it-when-it-should).
+- `cases`: each with `id`, `fixture`, `prompts` (see [Prompt variants](#prompt-variants-the-same-request-worded-otherwise)), and optionally `informative` (see [Informative cases](#informative-cases-what-the-agent-does-not-do-well-yet)), `expected_calls`, `forbidden_calls`, `outcome_checks` (`name` and `run`, as `rules_always_met`) and `expected_outcome` (each criterion `required: <text>` or `optional: <text>`; a plain text is `optional`). Any other key is an error, so a typo or a renamed field cannot turn a check off.
+
+Put in `rules_always_met` and `outcome_checks` everything that can be checked exactly, and leave `rules_always_met_judged` and `expected_outcome` for what needs judgment. A check's `name` is its key between sessions: no two checks of a case, the golden's `rules_always_met` included, share one, and renaming it starts a new row in `evals-compare`. The same goes for an `expected_outcome` criterion and its text; marking it `required` or `optional` does not change its key.
+
+```yaml
+expected_outcome:
+  - required: "The conflict was resolved by intent: …"     # missing it fails the run
+  - optional: "The commit description is in the imperative mood"
+  - "The scope names the module"                           # optional
+```
+
+A run passes `outcome` if it meets every `required` criterion and misses at most one `optional`. Mark `required` what the case is about, so that missing it is never the tolerated miss.
+
+### What each field checks
+
+| Field | Scope | Decided by | Metric | A run passes it if | If the agent changed nothing |
+|---|---|---|---|---|---|
+| `rules_always_met` | every case | code: a shell command, passes with exit code 0 | `rules_always_met` | every check passes | still checked |
+| `rules_always_met_judged` | every case | the judge | `rules_always_met_judged` | every rule is met | still judged |
+| `expected_calls` | its case | code: matched against the trace | `expected_calls` | every expected call appears, in any order (`any_of` for alternatives) | still checked |
+| `forbidden_calls` | its case | code: matched against the trace | `forbidden_calls` | no forbidden call appears | still checked |
+| `outcome_checks` | its case | code: a shell command, passes with exit code 0 | `outcome_checks` | every check passes | fails without running them |
+| `expected_outcome` | its case | the judge | `outcome` | every `required` criterion is met, and at most one `optional` is missed (none if it is the only criterion) | fails without judging |
+| `skill_loading` | its prompt | code: matched against the trace | `skill_loading` | the skill is loaded if it `should_load`, and not if it `should_not_load` | still checked |
+
+- `rules_always_met` is always code and `rules_always_met_judged` always the judge: whoever writes the golden picks the field for each rule, by whether it can be checked exactly.
+- Calls count as attempted: a call the runtime denied still meets `expected_calls`, and still breaks `forbidden_calls`.
+- Each metric is its own pytest test. A failed metric turns its case and the session red (unless it is a quality metric of an informative case), but the other metrics of the case are still scored and reported: nothing stops at the first failure.
+- Across runs, `expected_calls`, `outcome_checks`, `outcome` and `skill_loading` pass a case if at least `--min-passes` of the `--runs` runs pass them (2 of 3 by default). The prohibitions, `forbidden_calls`, `rules_always_met` and `rules_always_met_judged`, are strict: every run must pass them, so an agent that breaks one in 1 run of 3 fails the case. A run with an error (the runtime failed, another model answered, the judge failed twice) counts as not passed, so it fails a strict metric too. What is strict is fixed in `metrics/__init__.py`, not in the golden.
+- `before` and `inspect` check nothing: `before` records the state the checks compare with, and `inspect` shows the judge the state before and after the agent.
 
 Calls are written in the canonical vocabulary (`read_file`, `load_skill`, `shell`, `edit_file`, `write_file`...). A skill loaded with the runtime's skill tool is `load_skill` with the skill's name, without the plugin's prefix (Claude Code says `commons:git-workflow`, Copilot `git-workflow`). Paths are relative to the workspace, and a file of the plugin is `@plugins/<plugin>/...`.
 
 Write the prompts as a user would, without naming the skill: a case then also checks that the skill's description makes the agent load it.
+
+### Prompt variants: the same request, worded otherwise
+
+A skill tuned on one wording per case can pass the evals and fail users who ask the same thing in other words. So each case lists its prompt in one or more variants, each with an `id` and a `text`:
+
+```yaml
+cases:
+  - id: commit-feature
+    fixture: feature-on-main
+    prompts:
+      - id: directo
+        text: "Commitea estos cambios."
+      - id: coloquial
+        text: "venga, haz commit de lo que tengo y listo"
+      - id: con-contexto
+        text: "He añadido una función farewell en src/greeting.py (...). Commitea estos cambios."
+```
+
+- Run i gets variant i mod n, in order, not at random: with `--runs 3` and three variants each runs once; with 3 runs and two variants, the first runs twice; with fewer runs than variants, the last ones never run (the reports say `not run`). The runs without the skill of `--baseline` get the same variants.
+- The case passes or fails on all its runs together, with the usual rules (`--min-passes`, strict metrics N of N). Each variant's rate is only reported: it never fails a test.
+- The judge sees the variant the run got, not the first one.
+- A variant's `id` is any name you pick (`directo`, `con-ticket`, `usuario-nuevo`...), and its key between sessions: rewording its text or reordering the list keeps its history in `evals-compare`, renaming it starts a new row. Ids are unique within a case; nothing else is checked. A case with one variant is reported as before, without the breakdown.
+- Write the variants in the skill's language, as different users would word the same request: casual, with more context than needed, or naming the goal instead of the git verb.
+- `skill_loading` prompts have no variants: each one is already a case, so another wording is another prompt.
+
+### Informative cases: what the agent does not do well yet
+
+A case with `informative: true` measures something the agent still gets wrong sometimes, to see whether a change to the skill improves it. It is run and scored like any other case, but its quality metrics do not fail the session:
+
+```yaml
+cases:
+  - id: commit-breaking-change
+    informative: true
+    fixture: breaking-change
+    prompts:
+      - id: directo
+        text: "Commitea estos cambios."
+    outcome_checks:
+      - name: the commit is marked as a breaking change
+        run: git log -1 --format=%B | grep -Eq '^[a-z]+(\(.+\))?!:|^BREAKING CHANGE:'
+```
+
+- `expected_calls`, `outcome_checks` and `outcome` are informative: pytest marks them `XFAIL` when they fail and `XPASS` when they pass, and neither turns the session red.
+- The prohibitions (`forbidden_calls`, `rules_always_met`, `rules_always_met_judged`) stay required and strict: breaking one fails the session, informative case or not.
+- A `required` criterion of `expected_outcome` does not change this: it only decides whether a run passes `outcome`, and `outcome` stays informative.
+- The reports show its informative metrics with `ℹ️` instead of `✅`/`❌` and leave them out of the count of metrics passed; the PR comment adds how many reached the minimum. `summary.txt` heads their reports with `XFAIL` or `XPASS`.
+- When an informative case passes steadily (`XPASS` in several sessions; see `evals-compare`), remove `informative: true`: from then on it guards against regressions like the rest. Its id does not change, so its history in `evals-compare` goes on.
+- `skill_loading` prompts cannot be informative.
+
+### Skill loading: does the description load it when it should?
+
+An agent loads a skill when its `description` matches the request. The cases only check that it does when it should, on the prompts they were written for. A description broad enough to load the skill on any request about git would pass them all. `skill_loading` checks both sides, with prompts that only exist for it:
+
+```yaml
+skill_loading:
+  fixture: feature-on-main              # what every prompt starts from
+  should_load:                          # the skill's work, in other words than the cases
+    - "Guarda estos cambios en git."
+  should_not_load:                      # close to the skill, without asking for its work
+    - "¿Qué hace la función greet?"
+```
+
+- Each prompt is a case of its own, `should-load-<slug>` or `should-not-load-<slug>`, named after its text: rewording a prompt starts a new row in `evals-compare`. `-k should-` runs only them.
+- It runs with read-only tools (`read`, `search`, and loading skills): enough to decide whether to load the skill, not to do the work. A prompt that asks for a commit is a short run that cannot commit.
+- It is scored only by `skill_loading`: no `inspect`, `before`, rules or checks of the golden. It passes with `--min-passes` of the `--runs` runs, as a quality criterion: loading the skill when it is not needed breaks nothing by itself, and what would is caught by the prohibitions.
+- With `--baseline`, it does not run without the skill, since then it could not load it.
+- At the end of the session, the `eval skill loading` section, `results.json` (`skill_loading`) and the PR comment sum them up per skill: of the prompts that should load it, how many passed, and of those that should not, how many; with the runs that passed of each.
+- Good `should_not_load` prompts are near misses: about the same repo, its code or git itself, without asking for what the skill does. Prompts far from the skill pass without telling anything.
 
 ### Fixtures
 
@@ -80,12 +195,12 @@ A fixture is a folder copied as the agent's workspace. If it has a `setup.sh`, i
 
 Each case runs N times, each time in its own sandbox, an empty temporary folder:
 
-1. The fixture is copied to `workspace/`, the plugin under evaluation to `plugins/<plugin>/`, and the fixture's `setup.sh` runs in the workspace.
+1. The fixture is copied to `workspace/`, the plugin under evaluation to `plugins/<plugin>/` (without the skill under evaluation, in a baseline run), and the fixture's `setup.sh` runs in the workspace, followed by the golden's `before` commands.
 2. The sandbox gets its own environment: `bin/` first in the `PATH`, for stubs the fixture installs (for example, a `gh` that never reaches GitHub), its own git global configuration instead of yours (no hooks, signing or aliases of yours, a fixed identity), and `EVAL_SANDBOX` pointing at the sandbox, for setup scripts and stubs.
 3. The golden's `inspect` commands run, and the workspace's files are recorded.
 4. The session runs in the workspace with only that plugin loaded, through `--plugin-dir` on both runtimes, and the prompt. No sandbox beyond that: the agent's tools run on the machine, shell included.
 5. The log becomes a canonical trace. The workspace's path is removed, the plugin's copy becomes `@plugins/` and the rest of the sandbox `@sandbox/`.
-6. `inspect` runs again, and the final files go to the metrics with which of them the agent created or modified. Everything is saved next to the log, since the sandbox is deleted.
+6. `inspect` runs again, then the case's checks (the golden's `rules_always_met` and the case's `outcome_checks`), and the final files go to the metrics with which of them the agent created or modified. Everything is saved next to the log, since the sandbox is deleted.
 
 ### With `--provider claude`
 
@@ -113,7 +228,27 @@ The same runner and judge, with the models of Vertex AI instead of GitHub Copilo
 - No GitHub login: the session gets neither your `copilot login` nor `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`, so no model can come from GitHub.
 - Vertex reports reasoning tokens apart from output tokens, so they get their own column. There are no AI credits, and the usage table leaves out the cost and credit columns when nothing reports them.
 
-Each golden case runs N times, only once, and each metric is a pytest test that scores those same runs. A metric passes the case if at least `--min-passes` of the `--runs` runs pass it.
+Each golden case runs N times, only once, and each metric is a pytest test that scores those same runs. A metric passes the case if at least `--min-passes` of the `--runs` runs pass it, or all of them if it is strict (a prohibition).
+
+## Baseline: what the skill adds
+
+If the agent already does a case right without the skill, the case does not measure the skill. `--baseline` runs each case `--runs` more times without it, at the same time as the runs with it, and compares both:
+
+- Only the skill under evaluation is left out: its folder is removed from the plugin's copy in the sandbox, and the session still loads the plugin with `--plugin-dir`. The plugin's other skills, MCP servers and hooks stay loaded, as a user without the skill would have them. (`claude plugin eval --ablation` leaves out the whole plugin instead.)
+- What only the skill can pass does not count in either group: a call matcher that loads the skill by its name, or reads a file of its folder (`@plugins/<plugin>/skills/<skill>/...`), in `expected_calls` or `forbidden_calls`. An `any_of` with one such alternative counts as one. Nothing in the golden marks them. A metric left with nothing to score (`expected_calls` in `git-workflow`, which only loads the skill) has no baseline: `–`.
+- For each metric, the difference (Δ) is the pass rate with the skill minus without it, in points: 3/3 with it and 1/3 without it is +67 pp. The call metrics score both groups without what only the skill can pass, so their "with" rate can differ from the metric's own result. The other metrics reuse their result with the skill: the judge is not asked twice.
+- For each case, whether it passes with and without the skill, with the same rules (`--min-passes`, strict metrics N of N) on the metrics both can be scored on. A case that passes without the skill is flagged `⚠ passes without the skill: it does not measure it`.
+- It is informative: whether a test passes or fails is decided by the runs with the skill alone. Each metric's report adds the line `baseline: with skill 3/3 · without skill 1/3 · Δ +67 pp` (and, with several prompt variants, `baseline by variant: directo 1/1 vs 0/1 (+100 pp) · …`) and the runs without the skill; the `eval baseline` section at the end lists each case. The runs without the skill leave their logs in `.runs/<date>/` as `<case>-baseline-<i>-...`.
+- It doubles the agent's cost and the judge's, except for the `skill_loading` prompts, which do not run without the skill.
+
+## Efficiency: what the runs spend
+
+Next to whether a case passes, what its runs spend: a skill that does the same with twice the tokens, or adds ten turns to every commit, does not show in the metrics. Nothing new is collected: every run's trace already has it. It never passes or fails.
+
+- Per run: turns (model replies) and tool calls, adding up the main agent and its subagents; total tokens; cost, in dollars with Claude and AI credits with Copilot (`–` when the runtime does not report it, never 0); and the run's time.
+- Per case: the median of its runs without errors (another model, a runtime that failed), which do not count for the metrics either; their spending is still in the session's usage. The median is not moved by one run that went astray; that run is in `per_run`. Prompt variants are not broken down, and the `skill_loading` prompts get it too.
+- With `--baseline`: the median without the skill, and per measure the difference with the skill minus without it, absolute and in percent of the value without it (`+3 (+50 %)`; no percent over 0).
+- It shows in the `eval efficiency` table at the end (terminal and `summary.txt`), in `results.json` (`efficiency` in each case: `with_skill` and `without_skill` with their valid `runs`, `total_runs`, `median` and `per_run`, and `delta`) and in `evals-compare`. The PR comment only has the session's usage. The `eval usage` table and `results.json` keep the agent's runs without the skill in their own row (`agent without skill`).
 
 ## Requirements
 
@@ -161,6 +296,8 @@ EVALS_VERTEX_PROJECT=<project> EVALS_VERTEX_LOCATION=global \
 uv run pytest -m eval -s --runs 5 --min-passes 4 -k git-workflow   # one skill
 uv run pytest -m eval -s -k "commons/git-workflow/open-pr-"         # one case
 uv run pytest -m eval -s --model <candidate-model-id>   # try a new model against the pinned one
+uv run pytest -m eval -s --baseline -k git-workflow    # also without the skill: what it adds
+uv run pytest -m eval -s -k "git-workflow and should-"   # only whether the skill loads when it should
 ```
 
 ### Adding a case or a skill
@@ -169,15 +306,18 @@ uv run pytest -m eval -s --model <candidate-model-id>   # try a new model agains
 2. Add the case to that skill's `golden.yaml`, or create the golden. No test file is needed: `tests/evals/test_evals.py` runs every golden it finds.
 3. `uv run pytest` checks that the golden is in place and points at things that exist.
 4. `uv run pytest -m eval -s -k <plugin>/<skill>/<case-id>`.
+5. If the agent cannot pass it reliably yet, mark it `informative: true`, and remove the mark once it does.
 
 ## CI
 
 Two workflows in `../.github/workflows/`:
 
 - **`evals-unit-tests.yml`** (`evals unit tests` check): `ruff` and `uv run pytest` on every PR, not only those touching `evals/`, since it also checks the goldens against the plugins. It is meant to be a required check, and a required check whose workflow never starts stays pending and blocks the merge. It takes under a minute and calls no LLM.
-- **`evals.yml`** (`evals` check): the real evals, `--provider copilot --backend vertex --runs 3 --min-passes 2`, when a PR changes `plugins/**`, `evals/**` or the workflow itself. It is informative: a case below the minimum turns it red, but it is not required. A new push cancels the run of the previous one. PRs from forks skip it, since they cannot sign in to Google Cloud. It leaves:
+- **`evals.yml`** (`evals` check): the real evals, `--provider copilot --backend vertex --runs 3 --min-passes 2`, when a PR changes `plugins/**`, `evals/**` or the workflow itself. It is informative: a case below the minimum, or a prohibition broken in any run, turns it red, but it is not required. The quality metrics of an `informative` case never turn it red. A new push cancels the run of the previous one. PRs from forks skip it, since they cannot sign in to Google Cloud. It leaves:
   - a PR comment with each case's metrics and the usage (`uv run evals-report`), updated on every push;
   - the same report in the job summary, plus `summary.txt` with the judge's reasons;
   - the `evals-runs` artifact: `.runs/`, with the log, final files and state of every run.
+
+  With the `evals:baseline` label on the PR, it also runs each case without its skill (`--baseline`), and the report gets a column for each case without the skill and, per metric, the runs without it and the difference. Adding the label starts a run; other labels do not. It can also be run by hand (`workflow_dispatch`) on any branch, with or without `baseline`: then it posts no PR comment, only the job summary and the artifact.
 
 It signs in to Google Cloud without keys, through Workload Identity Federation, as a service account that can only call Vertex AI (`roles/aiplatform.user`). The workflow reads everything about GCP from repo variables, so none of it is in this public repo: `GCP_WIF_PROVIDER`, `GCP_EVALS_SERVICE_ACCOUNT`, `EVALS_VERTEX_PROJECT` and `EVALS_VERTEX_LOCATION`. Copilot CLI is pinned in the workflow; change it there and in the requirements above together.
