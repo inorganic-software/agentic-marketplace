@@ -7,6 +7,9 @@ Plugin marketplace for Claude Code and GitHub Copilot.
 | Plugin | What it does |
 | --- | --- |
 | `hello-world` | Sample plugin. Its `hello-world` skill writes `Hola mundo` to `hello-world.txt`, and its `bye-world` skill writes `Bye world` to `bye-world.txt`, both in the current folder. |
+| `commons` | Skills shared across repos and plugins. Its `git-workflow` skill covers trunk-based development, Conventional Branch names, Conventional Commits, pull requests and resolving rebase conflicts. |
+
+Skills have behavioral evals in `evals/`, which run them on Claude Code and Copilot CLI and judge what the agent does: see [evals/README.md](evals/README.md).
 
 ## Use it in a repo
 

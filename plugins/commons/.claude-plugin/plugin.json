@@ -1,0 +1,8 @@
+{
+  "name": "commons",
+  "description": "Skills shared across repos and plugins, such as the git workflow",
+  "version": "0.1.0",
+  "author": {
+    "name": "Inorganic"
+  }
+}

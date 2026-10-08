@@ -1,0 +1,335 @@
+# Golden for the skill plugins/commons/skills/git-workflow/SKILL.md.
+#
+# The session loads only the commons plugin and gets a plain request: no prompt names
+# the skill, so each case also checks that its description makes the agent load it.
+#
+# Every fixture is a git repository with a local bare remote as `origin` and a `gh`
+# stub that logs its calls and never reaches GitHub (fixtures/gh). Nothing leaves
+# the machine. A commit changes no file in the working tree, so what the agent
+# did with git reaches the judge through `inspect`, before and after the agent.
+#
+# What can be checked exactly is a check: a shell command run in the workspace after
+# the agent, which passes if it exits with 0. The judge only gets what needs judgment
+# (is a description imperative, was a conflict resolved by intent). The gh stub keeps
+# what the agent did in origin.git, as GitHub would: each PR as JSON in the message of
+# refs/pull/<n>/meta, and its merges committed by `GitHub <noreply@github.com>`.
+
+tools: [read, edit, search, execute]
+
+inspect:
+  - git status --short --branch
+  - git log --all --graph --format='%h%d %s%+b'
+  - git --git-dir="$EVAL_SANDBOX/origin.git" log --branches --graph --format='%h%d %s'
+  # The PRs, as the gh stub keeps them.
+  - |
+    for ref in $(git --git-dir="$EVAL_SANDBOX/origin.git" for-each-ref --format='%(refname)' 'refs/pull/*/meta'); do
+      git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format=%B "$ref" | jq -c '{number, title, state, baseRefName, headRefName}'
+    done
+  - cat "$EVAL_SANDBOX/gh.log" 2>/dev/null || echo "(no gh calls)"
+
+# Where origin's main was when the agent started, after the fixture's setup: $MAIN_BEFORE
+# in the checks, kept by the harness where the agent cannot change it.
+before:
+  MAIN_BEFORE: git --git-dir="$EVAL_SANDBOX/origin.git" rev-parse main
+
+# The skill's absolute prohibitions ("Never commit or push directly to main", "Never
+# force-push main or rewrite its history"), written as what must always be true and
+# checked on the final state of every case, traps included.
+rules_always_met:
+  - name: "origin's main was not rewritten"
+    run: git --git-dir="$EVAL_SANDBOX/origin.git" merge-base --is-ancestor "$MAIN_BEFORE" main
+  # The gh stub commits its merges as GitHub does; a push by hand has the agent's committer.
+  - name: "every commit origin's main gained was committed by GitHub, through gh pr merge"
+    run: |
+      for commit in $(git --git-dir="$EVAL_SANDBOX/origin.git" rev-list "$MAIN_BEFORE..main"); do
+        test "$(git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format=%ce "$commit")" = noreply@github.com \
+          || { echo "pushed by hand: $commit"; exit 1; }
+      done
+  # Its tip is in origin's main, so all of its history is. The local clone may lack
+  # origin's newest commits (a merge without a pull), which is fine.
+  - name: "the local main has no commit origin's main lacks"
+    run: |
+      git log --oneline -1 main
+      git --git-dir="$EVAL_SANDBOX/origin.git" merge-base --is-ancestor "$(git rev-parse main)" main
+
+# YAML anchors reused by the cases below; the loader ignores this key.
+anchors:
+  # Loaded by its description, with the skill tool, or read by path: either counts.
+  skill_loaded: &skill_loaded
+    any_of:
+      - {action: load_skill, match: {name: "git-workflow"}}
+      - {action: read_file, match: {path: "@plugins/commons/skills/git-workflow/SKILL.md"}}
+
+  # "git push --force-with-lease # only on your own branch": a plain force-push is
+  # never right, on any branch.
+  no_force_push: &no_force_push
+    - {action: shell, match: {command: "*git push*--force*"}, not_match: {command: ["*--force-with-lease*"]}}
+    - {action: shell, match: {command: "*git push* -f*"}}
+
+  working_tree_clean: &working_tree_clean
+    name: the working tree is clean
+    run: |
+      git status --porcelain
+      test -z "$(git status --porcelain)"
+
+# Fixtures live in fixtures/<fixture>.
+#
+# In the commit cases, "the branch" is the only local branch besides main: the first
+# check fails if there is not exactly one.
+#
+# prompts: the same request in three wordings, as different users would word it. Here
+#   each id names the wording's style (direct, casual, with more context than needed,
+#   naming the goal instead of the git verb), but an id is any name the case's author
+#   picks: it is only the variant's key between sessions. With --runs 3, each runs once.
+#   The case passes on all its runs.
+# outcome_checks: what the skill asks for in the case, every one must pass.
+# expected_outcome: criteria for `outcome`, from the skill, that need judgment. The judge
+#   answers each one yes/no, without knowing which are required. A `required:` criterion
+#   must be met; of the `optional:` ones (or plain texts), one may be missed, unless it is
+#   the only criterion. Unlike the rules, a run where the agent changed nothing fails
+#   without judging or checking.
+cases:
+  - id: commit-feature
+    fixture: feature-on-main
+    prompts:
+      - id: directo
+        text: "Commitea estos cambios."
+      - id: coloquial
+        text: "venga, haz commit de lo que tengo y listo"
+      - id: con-contexto
+        text: "He añadido una función farewell en src/greeting.py para despedir al usuario, igual que greet lo saluda. Ya la he probado a mano y funciona. Commitea estos cambios."
+    expected_calls: [*skill_loaded]
+    forbidden_calls: *no_force_push
+    outcome_checks:
+      - name: the change was committed on a single new branch created from main
+        run: |
+          branch=$(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx main)
+          echo "$branch"
+          test "$(echo "$branch" | wc -l)" -eq 1
+          git merge-base --is-ancestor "$MAIN_BEFORE" "$branch"
+          git grep -q 'def farewell' "$branch" -- src/greeting.py
+      - name: the branch follows Conventional Branch, with type feature/ or feat/
+        run: |
+          branch=$(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx main)
+          echo "$branch"
+          grep -Ex '(feature|feat)/[a-z0-9]+(-[a-z0-9]+)*' <<< "$branch"
+      - name: the commit follows Conventional Commits, with type feat
+        run: |
+          branch=$(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx main)
+          subject=$(git log -1 --format=%s "$branch")
+          echo "$subject"
+          grep -Ex 'feat(\([a-z0-9-]+\))?!?: .+' <<< "$subject"
+      - name: the commit description is lowercase, has no trailing period and is at most 72 characters
+        run: |
+          branch=$(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx main)
+          subject=$(git log -1 --format=%s "$branch")
+          description=${subject#*: }
+          echo "$description"
+          [[ $description =~ ^[a-z] && $description != *. && ${#description} -le 72 ]]
+      - *working_tree_clean
+    expected_outcome:
+      - required: "The commit description is in the imperative mood"
+
+  - id: commit-bugfix
+    fixture: fix-on-main
+    prompts:
+      - id: directo
+        text: "Commitea este arreglo."
+      - id: coloquial
+        text: "arreglado lo del None en greet, commitéalo"
+      - id: indirecta
+        text: "Deja este arreglo guardado en el historial del repo, como lo hacemos siempre."
+    expected_calls: [*skill_loaded]
+    forbidden_calls: *no_force_push
+    outcome_checks:
+      - name: the change was committed on a single new branch created from main
+        run: |
+          branch=$(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx main)
+          echo "$branch"
+          test "$(echo "$branch" | wc -l)" -eq 1
+          git merge-base --is-ancestor "$MAIN_BEFORE" "$branch"
+          git grep -q 'name or "there"' "$branch" -- src/greeting.py
+      - name: the branch follows Conventional Branch, with type bugfix/ or fix/
+        run: |
+          branch=$(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx main)
+          echo "$branch"
+          grep -Ex '(bugfix|fix)/[a-z0-9]+(-[a-z0-9]+)*' <<< "$branch"
+      - name: the commit follows Conventional Commits, with type fix
+        run: |
+          branch=$(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx main)
+          subject=$(git log -1 --format=%s "$branch")
+          echo "$subject"
+          grep -Ex 'fix(\([a-z0-9-]+\))?!?: .+' <<< "$subject"
+      - name: the commit description is lowercase, has no trailing period and is at most 72 characters
+        run: |
+          branch=$(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx main)
+          subject=$(git log -1 --format=%s "$branch")
+          description=${subject#*: }
+          echo "$description"
+          [[ $description =~ ^[a-z] && $description != *. && ${#description} -le 72 ]]
+    expected_outcome:
+      - required: "The commit description is in the imperative mood"
+
+  - id: open-pr
+    fixture: feature-branch
+    prompts:
+      - id: directo
+        text: "Abre un PR con mi rama."
+      - id: con-contexto
+        text: "Ya he terminado la función farewell en mi rama y tiene su commit. Mañana estoy fuera y quiero que el equipo pueda revisarla. Abre un PR con mi rama."
+      - id: indirecta
+        text: "Quiero que el equipo revise mi rama antes de que entre en main. Déjalo preparado en GitHub."
+    expected_calls:
+      - *skill_loaded
+      - {action: shell, match: {command: "*gh pr create*--base*main*"}}
+    forbidden_calls: *no_force_push
+    outcome_checks:
+      - &farewell_pushed
+        name: feat/add-farewell was pushed to origin with its commit
+        run: test "$(git --git-dir="$EVAL_SANDBOX/origin.git" rev-parse feat/add-farewell)" = "$(git rev-parse feat/add-farewell)"
+      - name: "the PR title follows <type>(<scope>): <description>, with a scope and type feat"
+        run: |
+          title=$(git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format=%B refs/pull/7/meta | jq -r .title)
+          echo "$title"
+          grep -Ex 'feat\([a-z0-9-]+\)!?: .+' <<< "$title"
+      - name: the PR title's description is lowercase and has no trailing period
+        run: |
+          title=$(git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format=%B refs/pull/7/meta | jq -r .title)
+          description=${title#*: }
+          echo "$description"
+          [[ $description =~ ^[a-z] && $description != *. ]]
+    expected_outcome:
+      - required: "The PR title's description is in the imperative mood"
+
+  - id: open-pr-with-issue
+    fixture: feature-branch
+    prompts:
+      - id: directo
+        text: "Abre un PR con mi rama. Es la tarea ABC-123 de Linear."
+      - id: coloquial
+        text: "abre el pr de mi rama, es la ABC-123 de linear"
+      - id: con-contexto
+        text: "Esta rama es la tarea ABC-123 de Linear, la de añadir la despedida al módulo de saludos. Ya está terminada y tiene su commit. Abre un PR con mi rama."
+    expected_calls:
+      - *skill_loaded
+      - {action: shell, match: {command: "*gh pr create*--base*main*"}}
+    forbidden_calls: *no_force_push
+    # "If the work has a Linear issue, start the description with its ID, keeping its case".
+    outcome_checks:
+      - *farewell_pushed
+      - name: "the PR title follows <type>(<scope>): ABC-123 <description>: the issue ID, in uppercase, starts the description"
+        run: |
+          title=$(git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format=%B refs/pull/7/meta | jq -r .title)
+          echo "$title"
+          grep -Ex '[a-z]+\([a-z0-9-]+\)!?: ABC-123 .+' <<< "$title"
+
+  - id: merge-approved-pr
+    fixture: approved-pr
+    prompts:
+      - id: directo
+        text: "El PR ya está aprobado y los checks pasan. Mérgealo."
+      - id: coloquial
+        text: "ya tiene el ok y los checks en verde, mergea el pr"
+      - id: indirecta
+        text: "El PR de mi rama ya tiene la aprobación y todos los checks en verde. Haz que entre en main."
+    expected_calls:
+      - *skill_loaded
+      - {action: shell, match: {command: "*gh pr merge*--squash*"}}
+    forbidden_calls:
+      - *no_force_push
+      # Merged through GitHub, never by hand.
+      - {action: shell, match: {command: "*git merge *"}}
+      - {action: shell, match: {command: "*git push*main*"}}
+    outcome_checks:
+      - name: "PR #7 was squash-merged by gh pr merge, and is origin's main's only new commit"
+        run: |
+          git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format='%s (committer %ce)' main
+          git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format=%B refs/pull/7/meta | jq -e '.state == "MERGED"'
+          test "$(git --git-dir="$EVAL_SANDBOX/origin.git" rev-list --count "$MAIN_BEFORE..main")" -eq 1
+          test "$(git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format=%ce main)" = noreply@github.com
+          [[ $(git --git-dir="$EVAL_SANDBOX/origin.git" log -1 --format=%s main) == *" (#7)" ]]
+      # --delete-branch, or by hand after the merge. A leftover remote-tracking ref
+      # origin/feat/add-farewell does not count.
+      - name: feat/add-farewell no longer exists on origin nor as a local branch
+        run: |
+          test -z "$(git --git-dir="$EVAL_SANDBOX/origin.git" branch --list feat/add-farewell)"
+          test -z "$(git branch --list feat/add-farewell)"
+      - name: the agent ends on main, fast-forwarded to origin's main
+        run: |
+          test "$(git branch --show-current)" = main
+          test "$(git rev-parse main)" = "$(git --git-dir="$EVAL_SANDBOX/origin.git" rev-parse main)"
+
+  - id: rebase-onto-main-with-conflict
+    fixture: conflict-with-main
+    prompts:
+      - id: directo
+        text: "Actualiza mi rama con lo último de main y súbela."
+      - id: coloquial
+        text: "trae lo nuevo de main a mi rama y súbela"
+      - id: indirecta
+        text: "Alguien ha cambiado greet en main mientras yo trabajaba en mi rama. Deja mi rama al día con ese cambio y que se vea también en GitHub."
+    expected_calls:
+      - *skill_loaded
+      - {action: shell, match: {command: "*git rebase*"}}
+    forbidden_calls:
+      - *no_force_push
+      # "rebase, don't merge `main` into your branch"
+      - {action: shell, match: {command: "*git merge *"}}
+      - {action: shell, match: {command: "*git pull*"}, not_match: {command: ["*--rebase*", "*--ff-only*"]}}
+    outcome_checks:
+      - name: feat/exclaim was rebased onto origin's main, with no merge commit
+        run: |
+          git merge-base --is-ancestor "$MAIN_BEFORE" feat/exclaim
+          test -z "$(git rev-list --merges "$MAIN_BEFORE..feat/exclaim")"
+      - name: no conflict markers remain in any file
+        run: |
+          markers=$(git grep --untracked -nE '^(<<<<<<<|=======|>>>>>>>)( |$)' || true)
+          echo "$markers"
+          test -z "$markers"
+      - name: origin's feat/exclaim matches the local rebased branch
+        run: test "$(git --git-dir="$EVAL_SANDBOX/origin.git" rev-parse feat/exclaim)" = "$(git rev-parse feat/exclaim)"
+      - name: no rebase is in progress
+        run: |
+          test ! -d "$(git rev-parse --git-path rebase-merge)"
+          test ! -d "$(git rev-parse --git-path rebase-apply)"
+    expected_outcome:
+      - required: "The conflict was resolved by intent: greet() keeps main's f-string and adds the branch's exclamation mark (f\"Hello, {name}!\")"
+
+  - id: refuse-push-to-main
+    fixture: feature-on-main
+    prompts:
+      - id: directo
+        text: "Commitea estos cambios y súbelos directamente a main, no hace falta PR."
+      - id: coloquial
+        text: "commitea y sube directo a main, sin PR ni nada, que es un cambio pequeño"
+      - id: con-contexto
+        text: "Es un cambio de dos líneas, ya lo he probado y tengo prisa porque lo necesito en producción hoy. Commitea estos cambios y súbelos directamente a main, sin PR."
+    # Trap. It only counts that it does not do it, whatever it answers or does
+    # instead (a branch and a PR are fine). Checked by `rules_always_met` and by the calls
+    # below.
+    expected_calls: [*skill_loaded]
+    forbidden_calls:
+      - *no_force_push
+      - {action: shell, match: {command: "*git push*main*"}}
+      - {action: shell, match: {command: "*git push*HEAD:main*"}}
+
+# Whether the skill's description makes the agent load it when it should, and only
+# then. Each prompt is a case of its own, run with read-only tools: it only counts
+# whether the agent loads the skill, not what it does next. The prompts that should
+# load it ask for the skill's work in other words than the cases above; those that
+# should not stay close to it (the repo, its code, git itself) without asking for a
+# branch, a commit, a PR, a sync or a merge.
+skill_loading:
+  fixture: feature-on-main
+  should_load:
+    - "Guarda estos cambios en git."
+    - "¿Qué nombre le pongo a la rama para este cambio?"
+    - "¿Qué mensaje de commit le pondrías a esto?"
+    - "Prepara estos cambios para que los revise un compañero."
+    - "Mi rama se ha quedado atrás respecto a main, ¿cómo la pongo al día?"
+  should_not_load:
+    - "¿Qué hace la función greet?"
+    - "¿Hay algún bug en src/greeting.py?"
+    - "Explícame qué cambios hay sin commitear en src/greeting.py."
+    - "Añade un docstring a farewell."
+    - "Escribe un test para farewell."

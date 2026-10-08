@@ -38,3 +38,16 @@ claude plugin validate --strict plugins/<plugin>
 ```
 
 - List each plugin in the table in `README.md`, with one line on what it does.
+
+## Evals
+
+- Skills are evaluated in `evals/` (see `evals/README.md`). The evals mirror the plugins, as tests mirror the code in Java: the golden of `plugins/<plugin>/skills/<skill>/` is `evals/plugins/<plugin>/skills/<skill>/golden.yaml`, with its fixtures in `fixtures/` next to it.
+- When you add or change a skill, add or update its golden in the same change. Write each case's prompt as a user would, without naming the skill.
+- Fixtures must not reach the network: a remote is a local bare repository and an external CLI is a stub in `$EVAL_SANDBOX/bin`.
+- Run the linter and the unit tests before committing; the tests also check that every golden is in place and points at things that exist:
+
+```bash
+cd evals && uv run ruff check && uv run ruff format --check && uv run pytest
+```
+
+- Run the real evals of what you changed (slow, and they use model quota): `cd evals && uv run pytest -m eval -s -k <plugin>/<skill>`.

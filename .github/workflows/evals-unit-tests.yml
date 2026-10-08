@@ -1,0 +1,45 @@
+name: Evals unit tests
+
+# The evals' unit tests: no LLM, under a minute. They run on every PR, not only
+# on the ones that touch evals/, because the check is required: a required check
+# whose workflow never starts stays pending and blocks the merge. They also
+# check that every golden mirrors a skill that exists and points at files that
+# exist, so a change in a plugin alone can break them.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evals-unit-tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: evals unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: evals
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # uv installs the Python in evals/.python-version.
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.19"
+          enable-cache: true
+          cache-dependency-glob: evals/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Lint
+        run: uv run ruff check && uv run ruff format --check
+
+      - name: Run unit tests
+        run: uv run pytest

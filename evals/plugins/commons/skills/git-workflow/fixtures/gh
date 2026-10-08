@@ -1,0 +1,667 @@
+#!/usr/bin/env python3
+"""`gh` stub for the git-workflow fixtures: GitHub, without leaving the machine.
+
+`install_gh_stub` (common.sh) copies it to $EVAL_SANDBOX/bin, first in the PATH. It
+imitates the commands and flags the agents have been seen to use, as gh 2.100.0 does
+when it is not run in a terminal, against the fixture's bare remote
+$EVAL_SANDBOX/origin.git standing in for github.com/example/greeting. Anything else
+fails as the real gh would (`unknown flag: --foo`), and is appended to
+$EVAL_SANDBOX/stub-gaps.jsonl, which the eval report shows: a gap of the stub, not a
+mistake of the agent.
+
+What the fixture sets up, and what the agent did, live apart:
+  - $EVAL_SANDBOX/gh/pr.json (optional, written by `write_pr`): a PR that already
+    exists when the agent starts, approved or not, with its checks.
+  - origin.git: each PR the agent creates, edits or merges is a chain of commits on
+    refs/pull/<n>/meta whose message is the PR as JSON, and its head on
+    refs/pull/<n>/head. A merge is committed by `GitHub <noreply@github.com>`, as on
+    github.com, so the checks can tell it from a commit pushed by hand.
+Every call is logged to $EVAL_SANDBOX/gh.log, which the judge sees, except `auth
+token`: Copilot CLI runs it at startup to look for a GitHub token (checked on 1.0.91),
+it is not the agent's work, and it must fail so the session keeps the runner's login.
+"""
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+VERSION = "gh version 2.100.0 (2026-09-03)\nhttps://github.com/cli/cli/releases/tag/v2.100.0"
+REPO = "example/greeting"
+REPO_URL = f"https://github.com/{REPO}"
+DEFAULT_BRANCH = "main"
+FIRST_PR = 7
+USER = "eval-agent"
+GITHUB_IDENTITY = {"GIT_COMMITTER_NAME": "GitHub", "GIT_COMMITTER_EMAIL": "noreply@github.com"}
+META_IDENTITY = {**GITHUB_IDENTITY, "GIT_AUTHOR_NAME": "GitHub", "GIT_AUTHOR_EMAIL": "noreply@github.com"}
+LABELS = [
+    {"name": "bug", "description": "Something isn't working", "color": "d73a4a"},
+    {"name": "documentation", "description": "Improvements or additions to documentation", "color": "0075ca"},
+    {"name": "enhancement", "description": "New feature or request", "color": "a2eeef"},
+]
+
+# The stub lives in <sandbox>/bin: the agent's environment does not say where the sandbox is.
+SANDBOX = Path(__file__).resolve().parent.parent
+ORIGIN = SANDBOX / "origin.git"
+FIXTURE_PR = SANDBOX / "gh" / "pr.json"
+
+
+class GhError(Exception):
+    """Ends the command as gh does: the message on stderr and exit code 1. A `gap` is
+    something real gh does that this stub does not imitate."""
+
+    def __init__(self, message: str, gap: bool = False):
+        super().__init__(message)
+        self.gap = gap
+
+
+# --- command line -----------------------------------------------------------------
+
+
+class Parser(argparse.ArgumentParser):
+    """argparse with gh's errors and gh's `--help`: short, without side effects."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, add_help=False, allow_abbrev=False, **kwargs)
+        self.add_argument("-h", "--help", action=HelpAction, help="Show help for command")
+
+    def error(self, message: str):
+        if "invalid choice:" in message:
+            choice = message.split("invalid choice: ")[1].split(" ")[0].strip("'")
+            raise GhError(f'unknown command "{choice}" for "{self.prog}"', gap=True)
+        if "expected one argument" in message:
+            flag = message.split("argument ")[1].split(":")[0].split("/")[-1]
+            raise GhError(f"flag needs an argument: {flag}")
+        if "the following arguments are required" in message:
+            print_help(self)
+            raise SystemExit(0)
+        raise GhError(message)
+
+    def subcommands(self, dest: str = "command") -> argparse._SubParsersAction:
+        return self.add_subparsers(dest=dest, required=True, parser_class=Parser)
+
+
+class HelpAction(argparse.Action):
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, default=argparse.SUPPRESS, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print_help(parser)
+        raise SystemExit(0)
+
+
+def print_help(parser: argparse.ArgumentParser) -> None:
+    lines = [parser.description or "", "", "USAGE", f"  {parser.prog} {parser.usage or '[flags]'}"]
+    commands = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
+    if commands:
+        lines += ["", "COMMANDS"]
+        lines += [f"  {c.dest}:  {c.help}" for c in commands[0]._choices_actions]
+    flags = [a for a in parser._actions if a.option_strings and a.dest != "help"]
+    if flags:
+        lines += ["", "FLAGS"]
+        for a in flags:
+            value = "" if a.nargs == 0 else f" {a.metavar or a.dest}"
+            lines.append(f"  {', '.join(a.option_strings)}{value}  {a.help or ''}")
+    lines += ["", "INHERITED FLAGS", "  --help  Show help for command"]
+    print("\n".join(lines).strip("\n"))
+
+
+def build_parser() -> Parser:
+    gh = Parser(prog="gh", description="Work seamlessly with GitHub from the command line.", usage="<command> <subcommand> [flags]")
+    gh.add_argument("--version", action="store_true", help="Show gh version")
+    commands = gh.subcommands("group")
+
+    auth = commands.add_parser("auth", help="Authenticate gh and git with GitHub", description="Authenticate gh and git with GitHub")
+    auth_commands = auth.subcommands()
+    auth_commands.add_parser("status", help="Display active account and authentication state", description="Display active account and authentication state on each known GitHub host.")
+    auth_commands.add_parser("token", help="Print the authentication token gh uses", description="Print the authentication token gh uses for a hostname and account.")
+
+    commands.add_parser("version", help="Show gh version", description="Show gh version")
+
+    label = commands.add_parser("label", help="Manage labels", description="Work with GitHub labels.")
+    label_list = label.subcommands().add_parser("list", help="List labels in a repository", description="Display labels in a GitHub repository.")
+    add_json_flags(label_list)
+    add_repo_flag(label_list)
+
+    repo = commands.add_parser("repo", help="Manage repositories", description="Work with GitHub repositories.")
+    repo_view = repo.subcommands().add_parser("view", help="View a repository", description="Display the description and the README of a GitHub repository.", usage="[<repository>] [flags]")
+    repo_view.add_argument("repository", nargs="?")
+    add_json_flags(repo_view)
+
+    pr = commands.add_parser("pr", help="Manage pull requests", description="Work with GitHub pull requests.")
+    pr_commands = pr.subcommands()
+
+    create = pr_commands.add_parser("create", help="Create a pull request", description="Create a pull request on GitHub.", usage="[flags]")
+    create.add_argument("-B", "--base", metavar="branch", help="The branch into which you want your code merged")
+    create.add_argument("-H", "--head", metavar="branch", help="The branch that contains commits for your pull request")
+    create.add_argument("-t", "--title", metavar="string", help="Title for the pull request")
+    create.add_argument("-b", "--body", metavar="string", help="Body for the pull request")
+    create.add_argument("-F", "--body-file", metavar="file", help='Read body text from file (use "-" to read from standard input)')
+    create.add_argument("-f", "--fill", action="store_true", help="Use commit info for title and body")
+    create.add_argument("-d", "--draft", action="store_true", help="Mark pull request as a draft")
+    create.add_argument("-l", "--label", metavar="name", action="append", default=[], help="Add labels by name")
+    create.add_argument("-r", "--reviewer", metavar="handle", action="append", default=[], help="Request reviews from people or teams by their handle")
+    create.add_argument("-a", "--assignee", metavar="login", action="append", default=[], help='Assign people by their login. Use "@me" to self-assign.')
+    add_repo_flag(create)
+
+    view = pr_commands.add_parser("view", help="View a pull request", description="Display the title, body, and other information about a pull request.", usage="[<number> | <url> | <branch>] [flags]")
+    view.add_argument("pr", nargs="?")
+    add_json_flags(view)
+    add_repo_flag(view)
+
+    pr_list = pr_commands.add_parser("list", help="List pull requests in a repository", description="List pull requests in a GitHub repository.")
+    pr_list.add_argument("-H", "--head", metavar="branch", help="Filter by head branch")
+    pr_list.add_argument("-B", "--base", metavar="branch", help="Filter by base branch")
+    pr_list.add_argument("-s", "--state", metavar="string", default="open", choices=["open", "closed", "merged", "all"], help='Filter by state: {open|closed|merged|all} (default "open")')
+    pr_list.add_argument("-L", "--limit", metavar="int", type=int, default=30, help="Maximum number of items to fetch (default 30)")
+    add_json_flags(pr_list)
+    add_repo_flag(pr_list)
+
+    status = pr_commands.add_parser("status", help="Show status of relevant pull requests", description="Show status of relevant pull requests.")
+    add_json_flags(status)
+    add_repo_flag(status)
+
+    checks = pr_commands.add_parser("checks", help="Show CI status for a single pull request", description="Show CI status for a single pull request.", usage="[<number> | <url> | <branch>] [flags]")
+    checks.add_argument("pr", nargs="?")
+    checks.add_argument("--watch", action="store_true", help="Watch checks until they finish")
+    checks.add_argument("--required", action="store_true", help="Only show checks that are required")
+    add_json_flags(checks)
+    add_repo_flag(checks)
+
+    edit = pr_commands.add_parser("edit", help="Edit a pull request", description="Edit a pull request.", usage="[<number> | <url> | <branch>] [flags]")
+    edit.add_argument("pr", nargs="?")
+    edit.add_argument("-t", "--title", metavar="string", help="Set the new title")
+    edit.add_argument("-b", "--body", metavar="string", help="Set the new body")
+    edit.add_argument("-F", "--body-file", metavar="file", help='Read body text from file (use "-" to read from standard input)')
+    edit.add_argument("-B", "--base", metavar="branch", help="Change the base branch for this pull request")
+    edit.add_argument("--add-label", metavar="name", action="append", default=[], help="Add labels by name")
+    edit.add_argument("--remove-label", metavar="name", action="append", default=[], help="Remove labels by name")
+    add_repo_flag(edit)
+
+    merge = pr_commands.add_parser("merge", help="Merge a pull request", description="Merge a pull request on GitHub.", usage="[<number> | <url> | <branch>] [flags]")
+    merge.add_argument("pr", nargs="?")
+    merge.add_argument("-s", "--squash", action="store_true", help="Squash the commits into one commit and merge it into the base branch")
+    merge.add_argument("-m", "--merge", action="store_true", help="Merge the commits with the base branch")
+    merge.add_argument("-r", "--rebase", action="store_true", help="Rebase the commits onto the base branch")
+    merge.add_argument("-d", "--delete-branch", action="store_true", help="Delete the local and remote branch after merge")
+    merge.add_argument("--auto", action="store_true", help="Automatically merge only after necessary requirements are met")
+    merge.add_argument("-t", "--subject", metavar="text", help="Subject text for the merge commit")
+    merge.add_argument("-b", "--body", metavar="text", help="Body text for the merge commit")
+    add_repo_flag(merge)
+    return gh
+
+
+def add_json_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--json", metavar="fields", nargs="?", const="", help="Output JSON with the specified fields")
+    parser.add_argument("-q", "--jq", metavar="expression", help="Filter JSON output using a jq expression")
+
+
+def add_repo_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("-R", "--repo", metavar="[HOST/]OWNER/REPO", help="Select another repository using the [HOST/]OWNER/REPO format")
+
+
+def parse(argv: list[str]) -> argparse.Namespace:
+    args, extra = build_parser().parse_known_args(argv)
+    for arg in extra:
+        if arg.startswith("-"):
+            raise GhError(f"unknown flag: {arg.split('=')[0]}", gap=True)
+    if extra:
+        raise GhError(f"accepts at most 1 arg(s), received {1 + len(extra)}")
+    if getattr(args, "repo", None) not in (None, REPO, f"github.com/{REPO}", REPO_URL):
+        raise GhError(f"GraphQL: Could not resolve to a Repository with the name '{args.repo}'. (repository)")
+    return args
+
+
+# --- git --------------------------------------------------------------------------
+
+
+def git(*args: str, origin: bool = False, cwd: str | None = None, env: dict | None = None, check: bool = True) -> str:
+    command = ["git", *(["--git-dir", str(ORIGIN)] if origin else []), *args]
+    proc = subprocess.run(command, cwd=cwd, env={**os.environ, **(env or {})}, input="", capture_output=True, text=True)
+    if check and proc.returncode != 0:
+        raise GhError(f"git {' '.join(args)}: {proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+def current_branch() -> str:
+    return git("rev-parse", "--abbrev-ref", "HEAD")
+
+
+def remote_sha(branch: str) -> str | None:
+    return git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", origin=True, check=False) or None
+
+
+def now() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# --- pull requests ----------------------------------------------------------------
+
+
+def load_prs() -> dict[int, dict]:
+    """Every PR by number: the fixture's, then what the agent did, which wins."""
+    prs = {}
+    if FIXTURE_PR.is_file():
+        pr = json.loads(FIXTURE_PR.read_text())
+        prs[pr["number"]] = pr
+    refs = git("for-each-ref", "--format=%(refname)", "refs/pull/", origin=True)
+    for ref in filter(None, refs.splitlines()):
+        if ref.endswith("/meta"):
+            pr = json.loads(git("log", "-1", "--format=%B", ref, origin=True))
+            prs[pr["number"]] = pr
+    for pr in prs.values():
+        pr.setdefault("body", "")
+        pr.setdefault("isDraft", False)
+        pr.setdefault("reviewDecision", "REVIEW_REQUIRED")
+        pr.setdefault("labels", [])
+        pr.setdefault("checks", [])
+        pr.setdefault("createdAt", now())
+        pr["url"] = f"{REPO_URL}/pull/{pr['number']}"
+    return prs
+
+
+def save_pr(pr: dict) -> None:
+    """A new commit on refs/pull/<n>/meta with the PR as its message."""
+    ref = f"refs/pull/{pr['number']}/meta"
+    parent = git("rev-parse", "--verify", "--quiet", ref, origin=True, check=False)
+    tree = git("hash-object", "-t", "tree", "-w", "--stdin", origin=True)
+    record = {k: v for k, v in pr.items() if k != "url"}
+    sha = git("commit-tree", tree, *(["-p", parent] if parent else []), "-m", json.dumps(record, ensure_ascii=False), origin=True, env=META_IDENTITY)
+    git("update-ref", ref, sha, origin=True)
+
+
+def find_pr(selector: str | None, prs: dict[int, dict]) -> dict:
+    """The PR a command points at: a number, a URL or a branch; by default the open PR
+    of the current branch."""
+    if selector:
+        number = selector.rstrip("/").rsplit("/", 1)[-1].lstrip("#")
+        if number.isdigit():
+            if int(number) in prs:
+                return prs[int(number)]
+            raise GhError(f"GraphQL: Could not resolve to a PullRequest with the number of {number}. (repository.pullRequest)")
+        branch = selector
+    else:
+        branch = current_branch()
+    matches = [pr for pr in prs.values() if pr["headRefName"] == branch]
+    open_matches = [pr for pr in matches if pr["state"] == "OPEN"]
+    if open_matches or matches:
+        return (open_matches or matches)[-1]
+    raise GhError(f'no pull requests found for branch "{branch}"')
+
+
+def checks_state(pr: dict) -> str:
+    """SUCCESS, FAILURE, PENDING, or NONE when the PR has no checks."""
+    conclusions = [c.get("conclusion") or "PENDING" for c in pr["checks"]]
+    if not conclusions:
+        return "NONE"
+    if any(c not in ("SUCCESS", "SKIPPED", "NEUTRAL", "PENDING") for c in conclusions):
+        return "FAILURE"
+    return "PENDING" if "PENDING" in conclusions else "SUCCESS"
+
+
+def merge_state(pr: dict) -> str:
+    if pr["state"] != "OPEN":
+        return "UNKNOWN"
+    if pr["isDraft"]:
+        return "DRAFT"
+    if pr["reviewDecision"] != "APPROVED" or checks_state(pr) in ("FAILURE", "PENDING"):
+        return "BLOCKED"
+    return "CLEAN"
+
+
+def pr_json(pr: dict) -> dict:
+    """The PR with the fields of `gh pr view --json`."""
+    return {
+        "number": pr["number"],
+        "title": pr["title"],
+        "body": pr["body"],
+        "state": pr["state"],
+        "isDraft": pr["isDraft"],
+        "url": pr["url"],
+        "author": {"login": USER},
+        "baseRefName": pr["baseRefName"],
+        "headRefName": pr["headRefName"],
+        "reviewDecision": pr["reviewDecision"],
+        "mergeable": "MERGEABLE" if pr["state"] == "OPEN" else "UNKNOWN",
+        "mergeStateStatus": merge_state(pr),
+        "labels": [{"name": name} for name in pr["labels"]],
+        "statusCheckRollup": [
+            {"__typename": "CheckRun", "name": c["name"], "status": "COMPLETED" if c.get("conclusion") else "IN_PROGRESS", "conclusion": c.get("conclusion") or ""}
+            for c in pr["checks"]
+        ],
+        "autoMergeRequest": pr.get("autoMergeRequest"),
+        "createdAt": pr["createdAt"],
+        "mergedAt": pr.get("mergedAt"),
+        "closed": pr["state"] != "OPEN",
+    }
+
+
+# The fields `--json` can ask for on a PR.
+PR_FIELDS = list(pr_json({
+    "number": 0, "title": "", "body": "", "state": "OPEN", "isDraft": False, "url": "", "baseRefName": "",
+    "headRefName": "", "reviewDecision": "", "labels": [], "checks": [], "createdAt": "",
+}))  # fmt: skip
+
+
+def json_fields(fields: str, available: list[str]) -> list[str]:
+    """The fields of `--json fields`, as gh checks them."""
+    if not fields:
+        raise GhError("Specify one or more comma-separated fields for `--json`:\n  " + "\n  ".join(sorted(available)))
+    wanted = [f.strip() for f in fields.split(",") if f.strip()]
+    for field in wanted:
+        if field not in available:
+            raise GhError(f'Unknown JSON field: "{field}"\nAvailable fields:\n  ' + "\n  ".join(sorted(available)), gap=True)
+    return wanted
+
+
+def emit_json(data, jq: str | None) -> None:
+    """`data` as JSON, or filtered by `--jq` with raw strings, as gh does."""
+    text = json.dumps(data, ensure_ascii=False)
+    if jq is None:
+        print(text)
+        return
+    try:
+        proc = subprocess.run(["jq", "-r", jq], input=text, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise GhError("jq is not installed: the gh stub needs it for --jq", gap=True) from None
+    if proc.returncode != 0:
+        raise GhError(proc.stderr.strip())
+    print(proc.stdout, end="")
+
+
+def output_json(data, fields: str, jq: str | None, available: list[str]) -> None:
+    """--json fields [--jq expression] of an object or a list: only the fields asked for."""
+    wanted = json_fields(fields, available)
+    pick = lambda item: {f: item[f] for f in wanted}  # noqa: E731
+    emit_json([pick(d) for d in data] if isinstance(data, list) else pick(data), jq)
+
+
+# --- commands ---------------------------------------------------------------------
+
+
+def pr_create(args) -> None:
+    prs = load_prs()
+    base = args.base or DEFAULT_BRANCH
+    head = args.head or current_branch()
+    if head == base:
+        raise GhError(f'head branch "{head}" is the same as base branch "{base}", cannot create a pull request')
+    if remote_sha(head) is None:
+        raise GhError("aborted: you must first push the current branch to a remote, or use the --head flag")
+    for pr in prs.values():
+        if pr["headRefName"] == head and pr["baseRefName"] == base and pr["state"] == "OPEN":
+            raise GhError(f'a pull request for branch "{head}" into branch "{base}" already exists:\n{pr["url"]}')
+    title, body = args.title, args.body
+    if args.body_file:
+        body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text()
+    if args.fill:
+        commits = git("log", "--reverse", "--format=%s%x00%b%x01", f"{remote_sha(base)}..{remote_sha(head)}", origin=True)
+        first = [c.split("\0") for c in commits.split("\x01") if c.strip()]
+        if title is None:
+            title = first[0][0].strip() if len(first) == 1 else head
+        if body is None:
+            body = first[0][1].strip() if len(first) == 1 else "\n".join(f"- {s.strip()}" for s, _ in first)
+    if title is None or body is None:
+        raise GhError("must provide `--title` and `--body` (or `--fill` or `fill-first` or `--fillverbose`) when not running interactively")
+    number = max([FIRST_PR - 1, *prs]) + 1
+    pr = {
+        "number": number, "title": title, "body": body, "state": "OPEN", "isDraft": args.draft,
+        "baseRefName": base, "headRefName": head, "reviewDecision": "REVIEW_REQUIRED",
+        "labels": args.label, "reviewers": args.reviewer, "assignees": args.assignee,
+        "checks": [], "createdAt": now(),
+    }  # fmt: skip
+    git("update-ref", f"refs/pull/{number}/head", remote_sha(head), origin=True)
+    save_pr(pr)
+    print(f"{REPO_URL}/pull/{number}")
+
+
+def pr_view(args) -> None:
+    pr = find_pr(args.pr, load_prs())
+    if args.json is not None:
+        output_json(pr_json(pr), args.json, args.jq, PR_FIELDS)
+        return
+    reviews = {"APPROVED": "Approved", "CHANGES_REQUESTED": "Changes requested"}.get(pr["reviewDecision"])
+    lines = [
+        f"title:\t{pr['title']}",
+        f"state:\t{'DRAFT' if pr['isDraft'] and pr['state'] == 'OPEN' else pr['state']}",
+        f"author:\t{USER}",
+        f"labels:\t{', '.join(pr['labels'])}",
+        f"assignees:\t{', '.join(pr.get('assignees', []))}",
+        f"reviewers:\t{'code-owner (' + reviews + ')' if reviews else ', '.join(pr.get('reviewers', []))}",
+        "projects:\t",
+        "milestone:\t",
+        f"number:\t{pr['number']}",
+        f"url:\t{pr['url']}",
+        f"auto-merge:\t{'enabled' if pr.get('autoMergeRequest') else 'disabled'}",
+        "--",
+        pr["body"],
+    ]
+    print("\n".join(lines))
+
+
+def pr_list(args) -> None:
+    prs = list(load_prs().values())
+    if args.state != "all":
+        prs = [pr for pr in prs if pr["state"] == args.state.upper()]
+    if args.head:
+        prs = [pr for pr in prs if pr["headRefName"] == args.head]
+    if args.base:
+        prs = [pr for pr in prs if pr["baseRefName"] == args.base]
+    prs = sorted(prs, key=lambda pr: -pr["number"])[: args.limit]
+    if args.json is not None:
+        output_json([pr_json(pr) for pr in prs], args.json, args.jq, PR_FIELDS)
+        return
+    for pr in prs:
+        print(f"{pr['number']}\t{pr['title']}\t{pr['headRefName']}\t{'DRAFT' if pr['isDraft'] else pr['state']}\t{pr['createdAt']}")
+
+
+
+
+def pr_status(args) -> None:
+    prs = load_prs()
+    branch = current_branch()
+    mine = [pr for pr in prs.values() if pr["state"] == "OPEN"]
+    current = next((pr for pr in prs.values() if pr["headRefName"] == branch), None)
+    if args.json is not None:
+        wanted = json_fields(args.json, PR_FIELDS)
+        pick = lambda pr: {f: pr_json(pr)[f] for f in wanted}  # noqa: E731
+        emit_json({"currentBranch": pick(current) if current else None, "createdBy": [pick(pr) for pr in mine], "needsReview": []}, args.jq)
+        return
+
+    def describe(pr: dict) -> str:
+        review = {"APPROVED": "Review approved", "CHANGES_REQUESTED": "Changes requested"}.get(pr["reviewDecision"], "Review required")
+        checks = {"SUCCESS": "Checks passing", "FAILURE": "Some checks failing", "PENDING": "Checks pending", "NONE": "No checks"}[checks_state(pr)]
+        state = "" if pr["state"] == "OPEN" else f" - {pr['state'].capitalize()}"
+        return f"  #{pr['number']}  {pr['title']} [{pr['headRefName']}]\n  - {checks} - {review}{state}"
+
+    lines = [f"Relevant pull requests in {REPO}", "", "Current branch"]
+    lines.append(describe(current) if current else f"  There is no pull request associated with [{branch}]")
+    lines += ["", "Created by you"]
+    lines += [describe(pr) for pr in mine] or ["  You have no open pull requests"]
+    lines += ["", "Requesting a code review from you", "  You have no pull requests to review"]
+    print("\n".join(lines))
+
+
+def pr_checks(args) -> None:
+    pr = find_pr(args.pr, load_prs())
+    rows = [
+        {"name": c["name"], "state": c.get("conclusion") or "PENDING",
+         "bucket": {"SUCCESS": "pass", "FAILURE": "fail", "SKIPPED": "skipping", "CANCELLED": "cancel"}.get(c.get("conclusion") or "", "pending"),
+         "link": f"{REPO_URL}/actions/runs/{i + 1}", "workflow": "ci"}
+        for i, c in enumerate(pr["checks"])
+    ]  # fmt: skip
+    if not rows:
+        raise GhError(f"no checks reported on the '{pr['headRefName']}' branch")
+    if args.json is not None:
+        output_json(rows, args.json, args.jq, ["bucket", "link", "name", "state", "workflow"])
+    else:
+        for row in rows:
+            print(f"{row['name']}\t{row['bucket']}\t2s\t{row['link']}\t")
+    state = checks_state(pr)
+    if state == "FAILURE":
+        raise SystemExit(1)
+    if state == "PENDING":
+        raise SystemExit(8)
+
+
+def pr_edit(args) -> None:
+    pr = find_pr(args.pr, load_prs())
+    if args.title is not None:
+        pr["title"] = args.title
+    if args.body is not None:
+        pr["body"] = args.body
+    if args.body_file:
+        pr["body"] = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text()
+    if args.base:
+        pr["baseRefName"] = args.base
+    pr["labels"] = [name for name in [*pr["labels"], *args.add_label] if name not in args.remove_label]
+    save_pr(pr)
+    print(pr["url"])
+
+
+def pr_merge(args) -> None:
+    pr = find_pr(args.pr, load_prs())
+    name = f"{REPO}#{pr['number']}"
+    if pr["state"] == "MERGED":
+        raise GhError(f"X Pull request {name} was already merged")
+    if pr["state"] != "OPEN":
+        raise GhError(f"X Pull request {name} is closed")
+    methods = [m for m in ("squash", "merge", "rebase") if getattr(args, m)]
+    if not methods:
+        raise GhError("--merge, --rebase, or --squash required when not running interactively")
+    if len(methods) > 1:
+        raise GhError("only one of --merge, --rebase, or --squash can be enabled")
+    method = methods[0]
+    if merge_state(pr) != "CLEAN":
+        if args.auto:
+            pr["autoMergeRequest"] = {"mergeMethod": method.upper()}
+            save_pr(pr)
+            print(f"✓ Pull request {name} will be automatically merged via {method} when all requirements are met")
+            return
+        raise GhError(
+            f"X Pull request {name} is not mergeable: the base branch policy prohibits the merge.\n"
+            "To have the pull request merged after all the requirements have been met, add the `--auto` flag.\n"
+            "To use administrator privileges to immediately merge the pull request, add the `--admin` flag."
+        )
+    head, base = pr["headRefName"], pr["baseRefName"]
+    if remote_sha(head) is None:
+        raise GhError(f"X Pull request {name}: the head branch {head} no longer exists")
+    merge_on_origin(pr, method, args.subject, args.body)
+    pr.update(state="MERGED", mergedAt=now())
+    save_pr(pr)
+    verb = {"squash": "Squashed and merged", "merge": "Merged", "rebase": "Rebased and merged"}[method]
+    print(f"✓ {verb} pull request {name} ({pr['title']})")
+    git("branch", "-D", head, origin=True)
+    if args.delete_branch:
+        if current_branch() == head:
+            if git("rev-parse", "--verify", "--quiet", f"refs/heads/{base}", check=False):
+                git("switch", "-q", base)
+            else:
+                git("switch", "-q", "-c", base, "--track", f"origin/{base}")
+        git("branch", "-q", "-D", head, check=False)
+        print(f"✓ Deleted local branch {head} and switched to branch {base}")
+        print(f"✓ Deleted remote branch {head}")
+
+
+def merge_on_origin(pr: dict, method: str, subject: str | None, body: str | None) -> None:
+    """Merge the PR's head into its base on origin, committed by GitHub, as github.com
+    does: in a clone of its own, so the agent's workspace is left as it was."""
+    head, base = pr["headRefName"], pr["baseRefName"]
+    with tempfile.TemporaryDirectory() as clone:
+        git("clone", "-q", "--branch", base, str(ORIGIN), clone)
+        run = lambda *a: git(*a, cwd=clone, env=GITHUB_IDENTITY)  # noqa: E731
+        commits = run("log", "--reverse", "--format=%s", f"{base}..origin/{head}").splitlines()
+        if method == "squash":
+            run("merge", "-q", "--squash", f"origin/{head}")
+            message = subject or f"{pr['title']} (#{pr['number']})"
+            run("commit", "-q", "-m", message, "-m", body if body is not None else "\n".join(f"* {c}" for c in commits))
+        elif method == "merge":
+            message = subject or f"Merge pull request #{pr['number']} from example/{head}"
+            run("merge", "-q", "--no-ff", "-m", message, "-m", body if body is not None else pr["title"], f"origin/{head}")
+        else:
+            for sha in run("rev-list", "--reverse", f"{base}..origin/{head}").splitlines():
+                run("cherry-pick", sha)
+        run("push", "-q", "origin", base)
+
+
+def gh_main(argv: list[str]) -> None:
+    if argv[:1] == ["help"]:
+        argv = [*argv[1:], "--help"]
+    args = parse(argv)
+    if args.version or args.command == "version":
+        print(VERSION)
+        return
+    handlers = {
+        ("auth", "status"): auth_status,
+        ("label", "list"): label_list,
+        ("repo", "view"): repo_view,
+        ("pr", "create"): pr_create,
+        ("pr", "view"): pr_view,
+        ("pr", "list"): pr_list,
+        ("pr", "status"): pr_status,
+        ("pr", "checks"): pr_checks,
+        ("pr", "edit"): pr_edit,
+        ("pr", "merge"): pr_merge,
+    }
+    handlers[(args.group, args.command)](args)
+
+
+def auth_status(args) -> None:
+    print(f"github.com\n  ✓ Logged in to github.com account {USER} (keyring)\n  - Active account: true")
+    print("  - Git operations protocol: https\n  - Token: gho_************************************")
+
+
+def label_list(args) -> None:
+    if args.json is not None:
+        output_json(LABELS, args.json, args.jq, ["color", "description", "name"])
+        return
+    for label in LABELS:
+        print(f"{label['name']}\t{label['description']}\t#{label['color']}")
+
+
+def repo_view(args) -> None:
+    if args.repository not in (None, REPO):
+        raise GhError(f"GraphQL: Could not resolve to a Repository with the name '{args.repository}'. (repository)")
+    data = {
+        "name": "greeting", "nameWithOwner": REPO, "owner": {"login": "example"}, "url": REPO_URL,
+        "description": "Greets people.", "defaultBranchRef": {"name": DEFAULT_BRANCH},
+        "isPrivate": False, "visibility": "PUBLIC",
+    }  # fmt: skip
+    if args.json is not None:
+        output_json(data, args.json, args.jq, list(data))
+        return
+    readme = git("show", f"{DEFAULT_BRANCH}:README.md", origin=True, check=False)
+    print(f"name:\t{REPO}\ndescription:\t{data['description']}\n--\n{readme}")
+
+
+def log_call(argv: list[str]) -> None:
+    with open(SANDBOX / "gh.log", "a") as log:
+        log.write("gh" + "".join(f" {shlex.quote(a)}" for a in argv) + "\n")
+
+
+def log_gap(argv: list[str], reason: str) -> None:
+    with open(SANDBOX / "stub-gaps.jsonl", "a") as gaps:
+        gaps.write(json.dumps({"stub": "gh", "argv": argv, "reason": reason}, ensure_ascii=False) + "\n")
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if argv[:2] == ["auth", "token"]:
+        return 1
+    log_call(argv)
+    try:
+        gh_main(argv)
+    except GhError as e:
+        if e.gap:
+            log_gap(argv, str(e).splitlines()[0])
+        print(str(e), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
